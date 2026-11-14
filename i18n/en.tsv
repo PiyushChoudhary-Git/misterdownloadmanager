@@ -868,6 +868,9 @@
 #. in a download's log: {name} is the archive's file name, {why} the reason
 #. {name} = a file name (keep the braces as they are)
 	Couldn't extract {name}: {why}	Couldn't extract {name}: {why}
+#. checkbox in the Add torrent window
+#. Add torrent: keep a multi-file torrent inside its own outer folder; untick to use Save to directly
+	Create a folder for this torrent	Create a folder for this torrent
 #. window title in a dialog box
 	Create folder	Create folder
 #. text in countries.rs
@@ -3742,6 +3745,8 @@
 #. why "Embed chapters" is greyed: ffmpeg (a helper program) is not installed
 #. why "Put them into the video" is greyed: ffmpeg (a helper program) is not installed
 	This needs ffmpeg	This needs ffmpeg
+#. text in the Add torrent window
+	This option is available for direct BitTorrent downloads	This option is available for direct BitTorrent downloads
 #. text in the Options window
 #. Options → Accounts: a portable copy (it writes nothing outside its folder) keeps the sign-ins in its own settings, encrypted so that only this Windows account can read them
 	This portable copy keeps sign-ins and passwords in its own settings, encrypted for your Windows account.	This portable copy keeps sign-ins and passwords in its own settings, encrypted for your Windows account.
@@ -3767,6 +3772,8 @@
 	This torrent is already in the download list	This torrent is already in the download list
 #. text in errors.rs
 	this torrent is not in the list	this torrent is not in the list
+#. message or event log entry in the main window; text in a download's Properties window
+	This torrent shares its destination folder	This torrent shares its destination folder
 #. text in the Download video window
 #. the Download video window: the page's video is copy-protected
 	This video is protected (DRM): no tool can save it.	This video is protected (DRM): no tool can save it.

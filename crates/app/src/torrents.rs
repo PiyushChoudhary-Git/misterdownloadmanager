@@ -25,6 +25,10 @@ pub struct TorrentSpec {
     pub files: Option<Vec<usize>>,
     /// Where its files go (a multi-file torrent's own folder included).
     pub folder: PathBuf,
+    /// Whether Add torrent adds its own outer folder. Old downloads retain that policy.
+    /// `folder` is already resolved and is used directly when resuming, either way.
+    #[serde(default = "subfolder_by_default")]
+    pub create_subfolder: bool,
     /// Bytes sent to peers, in all its runs (librqbit counts only the current one: from 0
     /// again at each resume and each start of the app). Kept by [`Accountant`].
     #[serde(default)]
@@ -55,11 +59,20 @@ pub struct TorrentSpec {
     pub ends_first: bool,
 }
 
+fn subfolder_by_default() -> bool {
+    true
+}
+
 fn first_and_last_first() -> bool {
     true
 }
 
 impl TorrentSpec {
+    /// A multi-file download whose row points to a shared destination, not an owned folder.
+    pub fn shares_folder(&self, dest: &Path) -> bool {
+        !self.create_subfolder && self.folder == dest
+    }
+
     /// The order its pieces are downloaded in (#39).
     pub fn order(&self) -> mdm_torrent::PieceOrder {
         if self.in_order {
@@ -782,20 +795,60 @@ impl Host {
         });
     }
 
-    /// Forget a torrent the list no longer has; its files stay unless `files` (and the session
-    /// runs: it knows which files are the torrent's).
-    pub fn forget(&self, rt: &tokio::runtime::Handle, hash: &str, files: bool) {
-        crate::torrent_rename::on_forget_torrent(hash);
-        if let Some(t) = self.get() {
-            let hash = hash.to_owned();
-            rt.spawn(async move {
-                let _ = t.remove(&hash, files).await;
-            });
-        }
-        if let Some(f) = torrent_file(hash) {
-            let _ = std::fs::remove_file(f);
+    /// Forget a torrent, using the saved metadata if completion or an idle session
+    /// already released its engine handle. Deletion never needs to start the network.
+    pub fn forget(&self, rt: &tokio::runtime::Handle, spec: &TorrentSpec, files: bool) {
+        crate::torrent_rename::ensure_loaded();
+        let (host, spec, file) = (self.clone(), spec.clone(), torrent_file(&spec.hash));
+        rt.spawn(async move {
+            let session = host.cell.lock().await.clone();
+            match forget_torrent(session, file, spec.clone(), files).await {
+                Ok(()) => crate::torrent_rename::on_forget_torrent(&spec.hash),
+                Err(error) => tracing::warn!("torrent files could not be removed: {error}"),
+            }
+        });
+    }
+}
+
+async fn forget_torrent(
+    session: Option<Arc<Torrents>>,
+    file: Option<PathBuf>,
+    spec: TorrentSpec,
+    files: bool,
+) -> Result<(), String> {
+    if let Some(t) = session
+        && t.has(&spec.hash)
+    {
+        // Release Windows file handles before touching the files ourselves.
+        if let Err(e) = t.remove(&spec.hash, false).await
+            && t.has(&spec.hash)
+        {
+            return Err(e.to_string());
         }
     }
+    tokio::task::spawn_blocking(move || {
+        if files {
+            let file = file.as_ref().ok_or("no saved torrent metadata")?;
+            let bytes = mdm_torrent::read_file(file).map_err(|e| e.to_string())?;
+            mdm_torrent::remove_files_from_bytes(
+                &bytes,
+                &spec.hash,
+                &spec.folder,
+                !spec.create_subfolder,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // Keep the metadata and rename mapping if deletion failed, for recovery.
+        if let Some(file) = file {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 enum RunState {
@@ -1171,8 +1224,13 @@ pub fn magnet_url(hash: &str, name: &str) -> url::Url {
 }
 
 /// The file the list row stands for: the torrent's folder, or its one file.
-pub fn dest_for(meta: &mdm_torrent::Meta, dir: &Path, files: Option<&[usize]>) -> PathBuf {
-    let folder = meta.folder_in(dir);
+pub fn dest_for(
+    meta: &mdm_torrent::Meta,
+    dir: &Path,
+    files: Option<&[usize]>,
+    create_subfolder: bool,
+) -> PathBuf {
+    let folder = meta.folder_in_with_subfolder(dir, create_subfolder);
     let chosen: Vec<&mdm_torrent::FileEntry> = meta
         .files
         .iter()
@@ -1195,6 +1253,7 @@ mod tests {
             hash: "h".into(),
             files: None,
             folder: "f".into(),
+            create_subfolder: true,
             uploaded: 0,
             seeded_secs: 0,
             peers: 0,
@@ -1203,6 +1262,105 @@ mod tests {
             in_order: false,
             ends_first: true,
         }
+    }
+
+    #[test]
+    fn direct_layout_survives_restart_and_old_downloads_keep_their_folder() {
+        let old: TorrentSpec =
+            serde_json::from_str(r#"{"hash":"h","files":null,"folder":"Downloads/Set"}"#).unwrap();
+        assert!(old.create_subfolder);
+        let mut direct = old;
+        direct.create_subfolder = false;
+        direct.folder = "Downloads".into();
+        let saved = serde_json::to_string(&direct).unwrap();
+        let restored: TorrentSpec = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.create_subfolder);
+        assert_eq!(restored.folder, Path::new("Downloads"));
+        assert!(restored.shares_folder(Path::new("Downloads")));
+        assert!(
+            !restored.shares_folder(Path::new("Downloads/one.bin")),
+            "a single file does not represent the shared directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_deletion_survives_detached_and_stopped_sessions() {
+        use mdm_torrent::librqbit;
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("a.bin"), b"abc").unwrap();
+        std::fs::write(source.join("nested/b.bin"), b"defg").unwrap();
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        let made = librqbit::create_torrent(
+            &source,
+            librqbit::CreateTorrentOptions {
+                name: Some("Set"),
+                trackers: Vec::new(),
+                piece_length: Some(16384),
+            },
+            &spawner,
+        )
+        .await
+        .unwrap();
+        let bytes = made.as_bytes().unwrap().to_vec();
+        let hash = librqbit::torrent_from_bytes(&bytes)
+            .unwrap()
+            .info_hash
+            .as_string();
+        let session = Arc::new(
+            Torrents::start(Config {
+                offline: true,
+                dht: false,
+                ..Config::new(tmp.path().join("session"))
+            })
+            .await
+            .unwrap(),
+        );
+        for lifecycle in 0..3 {
+            for sentinel in [false, true] {
+                let output = tmp.path().join(format!("case-{lifecycle}-{sentinel}"));
+                std::fs::create_dir_all(output.join("nested")).unwrap();
+                std::fs::write(output.join("a.bin"), b"abc").unwrap();
+                std::fs::write(output.join("nested/b.bin"), b"defg").unwrap();
+                if sentinel {
+                    std::fs::write(output.join("keep.txt"), b"unrelated").unwrap();
+                }
+                let file = tmp.path().join("saved.torrent");
+                std::fs::write(&file, &bytes).unwrap();
+                let mut spec = a_spec();
+                spec.hash = hash.clone();
+                spec.folder = output.clone();
+                spec.create_subfolder = false;
+                if lifecycle < 2 {
+                    session
+                        .add(&bytes, &output, None, Vec::new(), true)
+                        .await
+                        .unwrap();
+                    if lifecycle == 1 {
+                        session.remove(&hash, false).await.unwrap();
+                    }
+                }
+                let live = (lifecycle < 2).then(|| session.clone());
+                forget_torrent(live, Some(file.clone()), spec, true)
+                    .await
+                    .unwrap();
+                assert!(!file.exists());
+                assert!(!output.join("a.bin").exists());
+                assert!(!output.join("nested").exists());
+                assert!(
+                    output.is_dir(),
+                    "the shared destination survives even empty"
+                );
+                if sentinel {
+                    assert_eq!(
+                        std::fs::read(output.join("keep.txt")).unwrap(),
+                        b"unrelated"
+                    );
+                }
+            }
+        }
+        session.stop().await;
     }
 
     /// #357: the ratio the list and the General tab share, and the seeding limit's.
@@ -1308,6 +1466,7 @@ mod tests {
             hash: "h".into(),
             files: None,
             folder: "f".into(),
+            create_subfolder: true,
             uploaded,
             seeded_secs,
             peers: 0,

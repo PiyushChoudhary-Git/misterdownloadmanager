@@ -159,6 +159,79 @@ pub fn files_from_bytes(torrent: &[u8]) -> Result<Vec<FileEntry>, TorrentError> 
     Ok(entries)
 }
 
+/// Delete the files of a saved torrent without starting a session. The caller must
+/// detach any live handle first. Never recursively remove an output directory.
+pub fn remove_files_from_bytes(
+    torrent: &[u8],
+    expected_hash: &str,
+    folder: &Path,
+    keep_folder: bool,
+) -> Result<(), TorrentError> {
+    let meta = librqbit::torrent_from_bytes(torrent).map_err(|_| TorrentError::NotATorrent)?;
+    if !meta
+        .info_hash
+        .as_string()
+        .eq_ignore_ascii_case(expected_hash)
+    {
+        return Err(engine("the saved torrent has another info hash"));
+    }
+    let files = files_from_bytes(torrent)?;
+    // A single-file torrent uses the person's save folder, not an owned outer folder.
+    let keep_folder = keep_folder || files.iter().filter(|f| !f.padding).count() == 1;
+    remove_files_in(folder, &files, keep_folder).map_err(engine)
+}
+
+fn remove_files_in(folder: &Path, files: &[FileEntry], keep_folder: bool) -> std::io::Result<()> {
+    let root = match folder.canonicalize() {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // Check the entire list before deleting anything, including renamed paths and
+    // directory links which may have changed since the download finished.
+    for file in files.iter().filter(|f| !f.padding) {
+        check_relative_path(&file.path)
+            .map_err(|e| std::io::Error::other(TorrentError::UnsafeName(e)))?;
+        let path = folder.join(&file.path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing parent"))?;
+        match parent.canonicalize() {
+            Ok(parent) if !parent.starts_with(&root) => {
+                return Err(std::io::Error::other(
+                    "a torrent file's parent leaves the output folder",
+                ));
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    let mut directories = std::collections::BTreeSet::new();
+    let mut failure = None;
+    for entry in files.iter().filter(|f| !f.padding) {
+        let mut parent = entry.path.parent();
+        while let Some(dir) = parent.filter(|p| !p.as_os_str().is_empty()) {
+            directories.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+        if let Err(e) = std::fs::remove_file(folder.join(&entry.path))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            failure.get_or_insert(e);
+        }
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in directories {
+        // Non-empty directories belong to other files too, and must remain.
+        let _ = std::fs::remove_dir(folder.join(dir));
+    }
+    if !keep_folder {
+        let _ = std::fs::remove_dir(folder);
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 /// Before librqbit restores its saved torrents (`session.json` and a `<hash>.torrent` for each,
 /// in `dir`), take out the ones the name check refuses, and those saved without their .torrent
 /// (whose names it can't check): the app adds those again itself, through `add` and its own
@@ -285,7 +358,13 @@ impl Meta {
     /// Where its files go when saved in `dir`: a torrent of several files gets its own folder
     /// (named after it), a single file goes straight in.
     pub fn folder_in(&self, dir: &Path) -> PathBuf {
-        if self.files.iter().filter(|f| !f.padding).count() > 1 {
+        self.folder_in_with_subfolder(dir, true)
+    }
+
+    /// Where files go with the chosen outer-folder policy. Internal paths are kept;
+    /// choosing files does not turn a multi-file torrent into a single-file torrent.
+    pub fn folder_in_with_subfolder(&self, dir: &Path, create_subfolder: bool) -> PathBuf {
+        if create_subfolder && self.files.iter().filter(|f| !f.padding).count() > 1 {
             let name: String = self
                 .name
                 .chars()
@@ -312,7 +391,13 @@ impl Meta {
     /// (`folder_in`). Unticked ones count too: librqbit opens every file of the torrent, and
     /// writes into an unticked one the parts of a piece it shares with a ticked one.
     pub fn existing_in(&self, dir: &Path) -> Vec<PathBuf> {
-        let base = self.folder_in(dir);
+        self.existing_in_with_subfolder(dir, true)
+    }
+
+    /// Existing files at the same layout used for preview and the session's output.
+    /// Includes unselected files: pieces shared with selected files may write there.
+    pub fn existing_in_with_subfolder(&self, dir: &Path, create_subfolder: bool) -> Vec<PathBuf> {
+        let base = self.folder_in_with_subfolder(dir, create_subfolder);
         self.files
             .iter()
             .filter(|f| !f.padding)
@@ -1162,6 +1247,24 @@ impl Torrents {
         res
     }
 
+    /// Delete the torrent's files, preserving the user-selected output directory even
+    /// when it becomes empty. The backend's ordinary delete also removes that directory.
+    pub async fn remove_files_keep_folder(&self, hash: &str) -> Result<(), TorrentError> {
+        let output = PathBuf::from(
+            self.api
+                .api_torrent_details(id(hash)?)
+                .map_err(engine)?
+                .output_folder,
+        );
+        let (files, _, _) = self.files(hash).ok_or(TorrentError::Unknown)?;
+        // Detach first so no writer or Windows file handle is still using the files.
+        self.remove(hash, false).await?;
+        tokio::task::spawn_blocking(move || remove_files_in(&output, &files, true))
+            .await
+            .map_err(engine)?
+            .map_err(engine)
+    }
+
     /// Detach a torrent from the session before renaming its folder on disk, preserving its
     /// saved piece bitmap, chosen files, pause state, rate limits and piece order so [`Self::attach`]
     /// can restore sharing at the new folder (or back at the old folder if the rename fails).
@@ -1718,6 +1821,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn saved_file_deletion_validates_identity_and_preserves_shared_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("saved-delete-source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("a.bin"), b"abc").unwrap();
+        std::fs::write(source.join("nested/b.bin"), b"defg").unwrap();
+        let bytes = make_torrent(&source).await;
+        let hash = librqbit::torrent_from_bytes(&bytes)
+            .unwrap()
+            .info_hash
+            .as_string();
+        assert!(remove_files_from_bytes(&bytes, &"0".repeat(40), &source, false).is_err());
+        assert!(
+            source.join("a.bin").exists(),
+            "wrong metadata cannot delete files"
+        );
+        std::fs::write(source.join("keep.txt"), b"unrelated").unwrap();
+        remove_files_from_bytes(&bytes, &hash, &source, false).unwrap();
+        assert_eq!(
+            std::fs::read(source.join("keep.txt")).unwrap(),
+            b"unrelated"
+        );
+        assert!(!source.join("nested").exists());
+        std::fs::remove_file(source.join("keep.txt")).unwrap();
+        remove_files_from_bytes(&bytes, &hash, &source, true).unwrap();
+        assert!(source.is_dir(), "shared empty root remains");
+        remove_files_from_bytes(&bytes, &hash, &source, false).unwrap();
+        assert!(!source.exists(), "owned empty outer folder can be removed");
+    }
+
     /// A .torrent with one 5-byte file at `folder/<name>`, written by hand (librqbit makes only
     /// valid ones).
     fn torrent_naming(name: &str) -> Vec<u8> {
@@ -2083,6 +2217,107 @@ mod tests {
         );
         seeder.stop().await;
         leecher.stop().await;
+    }
+
+    /// #965: download directly into a shared folder, recheck there after restart,
+    /// and remove the torrent's files without removing unrelated files or the root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_layout_downloads_resumes_and_deletes_only_its_own_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("Set");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        let a = vec![7u8; 100_000];
+        let b = vec![11u8; 50_000];
+        std::fs::write(source.join("a.bin"), &a).unwrap();
+        std::fs::write(source.join("sub/b.bin"), &b).unwrap();
+        let torrent = make_torrent(&source).await;
+        let seed = Torrents::start(offline(&tmp.path().join("seed-state")))
+            .await
+            .unwrap();
+        let meta = seed
+            .metadata(
+                &Source::File(torrent.clone()),
+                Duration::from_secs(10),
+                None,
+            )
+            .await
+            .unwrap();
+        seed.add(&torrent, &source, None, Vec::new(), false)
+            .await
+            .unwrap();
+        let only_b = meta
+            .files
+            .iter()
+            .position(|f| f.path == Path::new("sub/b.bin"))
+            .unwrap();
+        for (case, selected) in [None, Some(vec![only_b])].into_iter().enumerate() {
+            let output =
+                meta.folder_in_with_subfolder(&tmp.path().join(format!("shared{case}")), false);
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(output.join("unrelated.txt"), b"keep me").unwrap();
+            let state = tmp.path().join(format!("download-state{case}"));
+            let download = Torrents::start(offline(&state)).await.unwrap();
+            let hash = download
+                .add(
+                    &torrent,
+                    &output,
+                    selected.clone(),
+                    vec![seed.listen_addr().unwrap()],
+                    false,
+                )
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while download.stats(&hash).unwrap().phase != Phase::Finished {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "direct-layout transfer timed out"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if selected.is_none() {
+                assert_eq!(std::fs::read(output.join("a.bin")).unwrap(), a);
+            }
+            assert_eq!(std::fs::read(output.join("sub/b.bin")).unwrap(), b);
+            assert!(!output.join("Set").exists(), "no added outer folder");
+            download.stop().await;
+            let restored = Torrents::start(offline(&state)).await.unwrap();
+            for old in restored.hashes() {
+                restored.remove(&old, false).await.unwrap();
+            }
+            // The app restores its resolved folder from downloads.json; no re-appending the name.
+            restored
+                .add(&torrent, &output, selected.clone(), Vec::new(), true)
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let stats = restored.stats(&hash).unwrap();
+                if stats.phase == Phase::Paused && stats.done == stats.total {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restored files were not found"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if case == 1 {
+                std::fs::remove_file(output.join("unrelated.txt")).unwrap();
+            }
+            restored.remove_files_keep_folder(&hash).await.unwrap();
+            if case == 0 {
+                assert_eq!(
+                    std::fs::read(output.join("unrelated.txt")).unwrap(),
+                    b"keep me"
+                );
+            }
+            assert!(output.is_dir(), "the shared root stays");
+            assert!(!output.join("a.bin").exists());
+            assert!(!output.join("sub/b.bin").exists());
+            restored.stop().await;
+        }
+        seed.stop().await;
     }
 
     /// The app's Recheck of a finished torrent that left the session: added again paused, it

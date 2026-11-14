@@ -10,7 +10,7 @@ MDM downloads BitTorrent files from magnet links and `.torrent` files. Torrents 
 2. **Add torrent** opens. Paste a magnet link into **Torrent**, or click **...** to choose a `.torrent` file, then click **Look up**.
 3. MDM reads the torrent and shows its files as a folder tree. A `.torrent` file is read at once. A magnet link first has to get the file list from other peers, usually within seconds. While it waits, **Add torrent** shows how many peers it found, from the trackers, the DHT or your local network, and how many answered. After 30 seconds without an answer, it says what may be in the way: a link with no trackers while the DHT is off, or a firewall, a VPN or a network that blocks BitTorrent.
 4. Untick the folders or files you don't want. **Select all** and **Select none** help with big torrents. **Selected** shows how many files and how much data you picked.
-5. Check **Save to**. **Files go to** shows the exact folder. Torrents have their own category, so by default this is `Downloads\Torrents`.
+5. Check **Save to**. **Files go to** shows the exact folder. Torrents have their own category, so by default this is `Downloads\Torrents`. For a multi-file torrent downloaded directly over BitTorrent, **Create a folder for this torrent** is ticked by default. Untick it to put the files directly in **Save to**, keeping their internal folders. The file tree and **Files go to** update to match. **Rename** is disabled while there is no outer folder to name.
 6. To watch a video while it downloads, tick **Download in order** (see [Download in order](#download-in-order)).
 7. Click **Download Now**, or **Later** to add it to the list without starting.
 
@@ -28,6 +28,8 @@ You can also paste a magnet link into **Add URL**, or drop a magnet link or a `.
 A `.torrent` file's web address works too: paste it into **Add URL** or **Torrent**, or let the browser hand the download over. MDM fetches the file, with the browser's cookies when the browser sent it, and **Add torrent** shows what it holds. The browser hands `.torrent` downloads over because `TORRENT` is in **Options → File types**. It's there by default; a list you had before this version keeps what it had, so add `TORRENT` to it yourself. **Download with Mister Download Manager** on a link always hands it over. A command line with `/n` (silent) saves the `.torrent` file itself, like any file. MDM fetches at most 10 MB: anything bigger isn't a `.torrent` file.
 
 If some of the torrent's files are already in the folder, MDM asks before using them. **Yes** keeps them for the torrent: MDM checks them, keeps what matches the torrent and downloads the rest, which is how you continue a download started elsewhere or share files you already have. **No** (the default) goes back, so you can choose another folder and nothing of yours is overwritten.
+
+The chosen layout is kept when the torrent is paused or MDM restarts. A multi-file torrent saved directly in **Save to** shares that directory: **Move/Rename** and folder renaming on completion are disabled for it so they cannot move unrelated files. Deleting the torrent's files leaves unrelated files and the shared destination folder in place. The layout option applies to direct BitTorrent downloads; torrents downloaded through a debrid account keep their existing layout.
 
 MDM refuses a torrent with file names your system can't write safely, says which name, and writes nothing. What others can see, the network switches in **Torrent settings**, blocklists and proxies: [Torrents and your security](torrent-security.md).
 

@@ -248,7 +248,11 @@ impl Properties {
             &dest.display().to_string(),
         );
         // Moving: a finished file is moved; one that hasn't started gets a new destination.
-        let movable = !running && (complete || item.downloaded == 0);
+        let shared = item
+            .torrent
+            .as_ref()
+            .is_some_and(|t| t.shares_folder(&item.dest));
+        let movable = !shared && !running && (complete || item.downloaded == 0);
         let pick = winui::button_light(
             ui,
             r(o, 393.0, 141.0, 73.0, 21.0),
@@ -264,7 +268,9 @@ impl Properties {
         let pick = winui::why_disabled(
             pick,
             !movable,
-            if running {
+            if shared {
+                crate::i18n::mark("This torrent shares its destination folder")
+            } else if running {
                 // i18n: tooltip of the greyed Move button in File Properties
                 crate::i18n::mark("Pause the download first")
             } else {
@@ -559,6 +565,7 @@ mod tests {
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             files: None,
             folder: PathBuf::from("f"),
+            create_subfolder: true,
             uploaded: 0,
             seeded_secs: 0,
             peers: 0,

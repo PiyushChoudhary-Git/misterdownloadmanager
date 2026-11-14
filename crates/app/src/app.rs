@@ -414,7 +414,15 @@ fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), String>
 
 /// Whether Move/Rename can take a download now: a finished file, or nothing of it come in yet.
 fn can_move(i: &Item) -> bool {
-    i.live.is_none() && (i.status == Status::Complete || i.downloaded == 0)
+    !torrent_shares_folder(i)
+        && i.live.is_none()
+        && (i.status == Status::Complete || i.downloaded == 0)
+}
+
+fn torrent_shares_folder(item: &Item) -> bool {
+    item.torrent
+        .as_ref()
+        .is_some_and(|t| t.shares_folder(&item.dest))
 }
 
 /// What is said when a download can't move, or stays while the others of a selection move.
@@ -625,6 +633,11 @@ fn deferred_rename_disabled_reason_with(
     rss: &crate::rss::Store,
     items: &[Item],
 ) -> Option<&'static str> {
+    if torrent_shares_folder(item) {
+        return Some(crate::i18n::mark(
+            "This torrent shares its destination folder",
+        ));
+    }
     if crate::deferred_rename::is_folder_target(item) {
         if is_protected_or_shared_folder_with(item.id, &item.dest, downloads, settings, rss, items)
         {
@@ -659,7 +672,9 @@ fn deferred_rename_disabled_reason_with(
 /// and they can start in the same moment, before the engine has reserved anything). None: it
 /// stays. A row with data of its own never moves, so a resume finds its pieces.
 fn place_to_take(item: &Item, items: &[Item]) -> Option<PathBuf> {
-    if item.downloaded > 0 || item.owns_resume_state() {
+    // Several torrents may intentionally share a destination directory. It must
+    // not be numbered as if it were a single file owned by one row.
+    if torrent_shares_folder(item) || item.downloaded > 0 || item.owns_resume_state() {
         return None;
     }
     let dir = item.dest.parent()?;
@@ -3511,12 +3526,12 @@ impl App {
     }
 
     /// Take a download off the list (not while it runs); with `files`, its file goes from disk
-    /// too: a finished file, or the data so far (a torrent's files when its session runs).
+    /// too: a finished file, or the data so far, including detached torrents.
     fn remove_download(&mut self, id: u64, files: bool) {
         if self.item(id).is_some_and(|i| i.live.is_none()) {
             self.release_link(id);
             if let Some(spec) = self.item(id).and_then(|i| i.torrent.clone()) {
-                self.torrent_host.forget(&self.rt, &spec.hash, files);
+                self.torrent_host.forget(&self.rt, &spec, files);
             } else if files
                 && let Some(i) = self.items.iter().find(|i| i.id == id)
                 // A gallery's folder stays (it may hold other files; #58).
@@ -4231,6 +4246,13 @@ impl App {
     /// A failure says why.
     fn start_move(&mut self, id: u64, target: PathBuf) {
         let Some(item) = self.item(id) else { return };
+        if torrent_shares_folder(item) {
+            self.notice = Some((
+                crate::i18n::mark("Move/Rename"),
+                crate::i18n::t("This torrent shares its destination folder").to_owned(),
+            ));
+            return;
+        }
         if target == item.dest {
             return;
         }
@@ -5248,8 +5270,9 @@ impl App {
             ));
             return None;
         }
-        let folder = meta.folder_in(&add.dir);
-        let dest = crate::torrents::dest_for(meta, &add.dir, add.files.as_deref());
+        let folder = meta.folder_in_with_subfolder(&add.dir, add.create_subfolder);
+        let dest =
+            crate::torrents::dest_for(meta, &add.dir, add.files.as_deref(), add.create_subfolder);
         let preexisting =
             if dest == folder && crate::deferred_rename::folder_has_any_entries(&folder) {
                 let allowed: Vec<PathBuf> = meta
@@ -5288,10 +5311,15 @@ impl App {
         );
         if let Some(item) = self.item(id) {
             item.preexisting_folder = preexisting;
+            // The shared folder is where files go, not the torrent's display name.
+            if !add.create_subfolder && meta.files.iter().filter(|f| !f.padding).count() > 1 {
+                item.file_name = meta.name.clone();
+            }
             item.torrent = Some(crate::torrents::TorrentSpec {
                 hash: meta.info_hash.clone(),
                 files: add.files.clone(),
                 folder,
+                create_subfolder: add.create_subfolder,
                 uploaded: 0,
                 seeded_secs: 0,
                 peers: 0,
@@ -5583,6 +5611,7 @@ impl App {
             category: Category::Torrents,
             start_now: !r.later,
             from_magnet,
+            create_subfolder: true,
             // RSS rules download as torrents usually do: the rarest pieces first.
             in_order: false,
             queue: None,
@@ -6170,6 +6199,7 @@ impl App {
                 category,
                 start_now: queue.is_none(),
                 from_magnet,
+                create_subfolder: true,
                 in_order: false,
                 queue,
                 quiet: true,
@@ -9766,6 +9796,13 @@ impl App {
         let Some(item) = self.items.iter().find(|i| i.id == id) else {
             return;
         };
+        if torrent_shares_folder(item) {
+            self.notice = Some((
+                crate::i18n::mark("Move/Rename"),
+                crate::i18n::t("This torrent shares its destination folder").to_owned(),
+            ));
+            return;
+        }
         if !can_move(item) {
             // Said, not silently ignored (F2, Ctrl+M on a download that can't move).
             self.notice = Some(cant_move_notice());
@@ -10485,8 +10522,9 @@ impl App {
                 }
             }
         }
+        let local_torrent = self.torrent_account().is_none();
         if let Some(t) = &mut self.torrent_dlg {
-            let closed = match t.show(ctx, &self.rt) {
+            let closed = match t.show(ctx, &self.rt, local_torrent) {
                 Outcome::Open => false,
                 Outcome::Closed => true,
                 Outcome::Done(add) => {
@@ -12224,6 +12262,53 @@ mod deferred_rename_guard_tests {
     }
 
     #[test]
+    fn a_direct_torrent_cannot_move_or_rename_its_shared_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = test_item(1, dir.path().to_owned());
+        item.torrent = Some(crate::torrents::TorrentSpec {
+            hash: "0".repeat(40),
+            files: None,
+            folder: dir.path().to_owned(),
+            create_subfolder: false,
+            uploaded: 0,
+            seeded_secs: 0,
+            peers: 0,
+            up_speed: 0.0,
+            upload_limit: None,
+            in_order: false,
+            ends_first: true,
+        });
+        assert!(
+            !can_move(&item),
+            "even an empty destination is shared, not owned"
+        );
+        assert_eq!(
+            deferred_rename_disabled_reason_with(
+                &item,
+                &dir.path().join("Downloads"),
+                &Settings::default(),
+                &crate::rss::Store::default(),
+                &[],
+            ),
+            Some("This torrent shares its destination folder")
+        );
+        let mut owner = item.place_copy();
+        owner.status = Status::Complete;
+        let mut another = item.place_copy();
+        another.id = 2;
+        assert_eq!(
+            place_to_take(&another, &[owner, another.place_copy()]),
+            None,
+            "a shared root is not numbered away from the saved files"
+        );
+        let restored: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert!(
+            !can_move(&restored),
+            "ownership does not change after a restart"
+        );
+    }
+
+    #[test]
     fn guards_split_archives_and_single_file_torrents() {
         let dir = tempfile::tempdir().unwrap();
         let downloads = dir.path().join("Downloads");
@@ -12238,6 +12323,7 @@ mod deferred_rename_guard_tests {
         single_torrent.torrent = Some(crate::torrents::TorrentSpec {
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             folder: downloads.clone(),
+            create_subfolder: true,
             files: None,
             uploaded: 0,
             seeded_secs: 0,
@@ -12254,6 +12340,7 @@ mod deferred_rename_guard_tests {
         folder_torrent.torrent = Some(crate::torrents::TorrentSpec {
             hash: "fedcba9876543210fedcba9876543210fedcba98".into(),
             folder: pack_dir,
+            create_subfolder: true,
             files: None,
             uploaded: 0,
             seeded_secs: 0,
