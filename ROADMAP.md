@@ -585,6 +585,10 @@ These ship in the next version.
   completion happens beside the window (for [#1103](https://github.com/anefzaoui/misterdownloadmanager/issues/1103))
 - ✅ A crash while checking for updates on some computers; a check that goes wrong says why
   ([#1123](https://github.com/anefzaoui/misterdownloadmanager/issues/1123))
+- ✅ An RSS feed's failed first fetch leaves its backlog a backlog, and an empty search feed still
+  gets its episode as news
+- ✅ An excluded site is the same site written with the root's dot (`example.com.`), in the app
+  and the extension
 - ✅ Proxy auto-config follows the address a script was given, and an https address's path stays
   out of the script
 - ✅ Tests: the programs tests write and then run (the extraction tests' stand-in for HatchZip,
@@ -595,6 +599,9 @@ These ship in the next version.
   directory** on Windows: its name is shortened so its download's files fit Windows' path limit,
   and a name or folder too long says so
   ([#1102](https://github.com/anefzaoui/misterdownloadmanager/issues/1102))
+- ✅ A gallery of tens of thousands of files already in its folder no longer seems to hang: its
+  files are listed in time linear in their number
+  ([#1142](https://github.com/anefzaoui/misterdownloadmanager/issues/1142))
 - ✅ Tests: the checks that a long list is read in linear time, which still failed now and then on
   a busy macOS runner, time one input 16 times as long against 16 short ones (as many items, as
   long a run), take each side's fastest of several runs, and fail at three times as long (a square
