@@ -502,33 +502,27 @@ fn take_place(item: &mut Item, target: PathBuf) {
     item.moved_away = false;
 }
 
-/// Update `item.pending_mark` after `from` has been renamed to `actual_to` (including renaming
-/// `yt-dlp` sidecar subtitle files alongside a video, or rewriting saved file paths inside a
-/// renamed gallery folder) so `flush_pending_mark` marks the final paths on disk.
-fn apply_renamed_paths_to_pending_mark(
-    item: &mut Item,
+/// A finished download's rename on completion (#655), on a thread other than the window's
+/// (#1103): `from` takes the name `desired` (numbered when it is taken), a video's subtitles
+/// (`side`) going with it. Its own path when there is nothing to rename. The mark that it came
+/// from the internet, written before it was done, goes along (a rename keeps it).
+fn rename_finished(
     from: &std::path::Path,
-    actual_to: &std::path::Path,
+    desired: &str,
     is_dir: bool,
-) {
-    let Some(pm) = item.pending_mark.as_mut() else {
-        return;
+    side: &[PathBuf],
+) -> Result<PathBuf, String> {
+    use crate::deferred_rename::{
+        rename_reserved_or_number, rename_video_side_files, reserve_target_path,
     };
-    if is_dir {
-        for gf in &mut pm.gallery_files {
-            if let Ok(rel) = gf.strip_prefix(from) {
-                *gf = actual_to.join(rel);
-            }
-        }
-    } else {
-        if pm.main_file.is_some() {
-            pm.main_file = Some(actual_to.to_path_buf());
-        }
-        if !pm.side_files.is_empty() {
-            pm.side_files =
-                crate::deferred_rename::rename_video_side_files(from, actual_to, &pm.side_files);
-        }
+    let Some((to, hold)) = reserve_target_path(from, desired, is_dir) else {
+        return Ok(from.to_owned());
+    };
+    let to = rename_reserved_or_number(from, to, hold, is_dir).map_err(|e| e.to_string())?;
+    if !is_dir && !side.is_empty() {
+        rename_video_side_files(from, &to, side);
     }
+    Ok(to)
 }
 
 /// Whether `folder` is a root/category/save folder or contains another download's files, making a
@@ -707,16 +701,26 @@ fn place_to_take(item: &Item, items: &[Item]) -> Option<PathBuf> {
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
     };
-    if item.video.is_some() {
-        // yt-dlp takes any `<stem>.*` there as its own (#32): the stem has to be free.
-        others()
-            .any(|o| stem(o) == stem(item) && o.holds_place())
-            .then(|| {
-                mdm_engine::naming::stem_destination(dir, &item.file_name, |s| {
-                    let s = s.to_lowercase();
-                    others().any(|o| stem(o).as_ref() == Some(&s) && o.holds_place())
-                })
-            })
+    if let Some(video) = &item.video {
+        // yt-dlp takes any `<stem>.*` there as its own (#32): the stem has to be free. A page's
+        // title named before titles were fitted to the path limits with the files a video has
+        // beside it (#1102) is shortened now; a name the user typed stays as typed.
+        let too_long = !video.named
+            && !item
+                .dest
+                .file_stem()
+                .is_some_and(|s| mdm_engine::naming::stem_fits(dir, &s.to_string_lossy()));
+        let in_use = |s: &str| {
+            let s = s.to_lowercase();
+            others().any(|o| stem(o).as_ref() == Some(&s) && o.holds_place())
+        };
+        (too_long || others().any(|o| stem(o) == stem(item) && o.holds_place())).then(|| {
+            if video.named {
+                mdm_engine::naming::typed_stem_destination(dir, &item.file_name, in_use)
+            } else {
+                mdm_engine::naming::stem_destination(dir, &item.file_name, in_use)
+            }
+        })
     } else {
         others()
             .any(|o| lower(&o.dest) == lower(&item.dest) && o.holds_place())
@@ -952,6 +956,8 @@ pub struct App {
     /// Link grabber (#37): links from the browser, Tasks → Import, drops and pastes, in
     /// packages to tick before adding.
     grabber: Option<crate::grabber::Grabber>,
+    /// A page's links from the browser that came in parts, until the last one is in.
+    link_parts: crate::linkparts::LinkParts,
     /// When `follow_assistive_technology` last asked (#131).
     assistive_checked: Option<Instant>,
     /// Archives extracted when their download completes (#37).
@@ -1053,11 +1059,12 @@ pub struct App {
     save_failed: Option<String>,
     /// Finished files being moved (Move/Rename, Properties → Move): where to, and the answer.
     moving: Vec<(u64, PathBuf, MoveDone)>,
-    /// Finished torrents whose deferred rename is running asynchronously through `torrent_host`.
+    /// Finished downloads whose rename on completion is under way: a file's on a thread of its
+    /// own (#1103), a torrent's through `torrent_host`. The answer: the new path, and why
+    /// sharing stopped.
     #[allow(clippy::type_complexity)]
-    renaming_torrents: Vec<(
+    renaming: Vec<(
         u64,
-        PathBuf,
         std::sync::mpsc::Receiver<(Result<PathBuf, String>, Option<String>)>,
     )>,
     /// Finished downloads whose deferred rename is persisted on `Item::rename_on_complete` and
@@ -1065,8 +1072,6 @@ pub struct App {
     deferred_torrent_queue: Vec<u64>,
     /// A finished queue asked to turn the computer off: the countdown, cancellable.
     turn_off: Option<dialogs::TurnOffCountdown>,
-    /// A finished queue asked to exit.
-    exit_requested: bool,
     /// The global speed cap shared by every download (Speed Limiter settings).
     global: std::sync::Arc<mdm_engine::limiter::Limiter>,
     /// Connection caps learned per host, shared by every download.
@@ -1232,29 +1237,12 @@ fn page_data_for(link: &str, page: Option<&str>, data: Option<&str>) -> Option<S
         .flatten()
 }
 
-/// Marks finished files (a video's and its subtitles, a gallery's pictures) as downloaded from the
-/// web, as `mark_hook` does for the engine's, on a thread of their own: writing the mark has the
-/// antivirus read the whole file again, and on a big video that kept the window waiting (#510). A
-/// file moved or removed meanwhile is left alone: marking its old path would create an empty
-/// file there.
-pub(crate) fn mark_finished(
-    files: Vec<std::path::PathBuf>,
-    url: String,
-    referrer: Option<String>,
-) -> Option<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("mark-downloaded".into())
-        .spawn(move || {
-            for f in files.iter().filter(|f| f.is_file()) {
-                crate::webmark::mark(f, &url, referrer.as_deref());
-            }
-        })
-        .ok()
-}
-
 /// Marks each file the engine starts writing as downloaded from the web (Mark-of-the-Web, macOS'
 /// quarantine: `webmark::mark`, as the option and Windows' policy say), as browsers mark theirs.
-/// Only http(s) addresses (an FTP address may carry its login).
+/// Only http(s) addresses (an FTP address may carry its login). Also what a video's and a
+/// gallery's jobs show their saved files to, on their own threads before they say they are done
+/// (#1103): never on the window's thread, where a disk slow to take the mark froze the window
+/// (#510), and always before the file can be opened or renamed (a rename keeps the mark).
 pub(crate) fn mark_hook(url: &url::Url, referrer: Option<&str>) -> mdm_engine::FileHook {
     let web = matches!(url.scheme(), "http" | "https");
     let (url, referrer) = (url.to_string(), referrer.map(str::to_owned));
@@ -1456,9 +1444,21 @@ impl App {
         self
     }
 
-    /// Asked to quit (File → Exit, `/exit`, the Scheduler's "Exit when done").
+    /// Asked to quit (File → Exit, `/exit`, the Scheduler's "Exit when done"): [`App::quit`].
     pub fn wants_exit(&self) -> bool {
-        self.exiting || self.exit_requested
+        self.exiting
+    }
+
+    /// Every way MDM is asked to quit comes here: File → Exit, the tray's Exit, `/exit` (the
+    /// command line, a second launch), Update now, and a queue's or a download's "Exit when done".
+    /// The close that follows quits whatever Options' "Keep running when closing the window" says
+    /// (`tray::on_close`); only closing the window itself follows that setting. The list and the
+    /// settings are saved as the app goes (`Drop`), and the crash monitor is told it's a clean exit
+    /// (main.rs). A headless run stops at its next pass (`wants_exit`).
+    fn quit(&mut self, ctx: &egui::Context) {
+        tracing::info!("quitting");
+        self.exiting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     pub fn new(
@@ -1522,10 +1522,10 @@ impl App {
             if settings.launch_on_startup && mdm_ipc::portable_dir().is_none() {
                 crate::unix::update_run_at_startup();
             }
-            if mdm_ipc::portable_dir().is_none() && !crate::offscreen() {
-                crate::unix::register_browsers();
-            }
         }
+        // Browser integration: a registration that leads nowhere is repaired (#818); Linux and
+        // macOS, which have no installer step, register with each browser here too.
+        crate::extension::repair_at_start();
         // The categories, for code that only has a `Category` (the list's own below too).
         settings.publish_categories();
         // The remote control (#141): off unless Options → Remote turned it on.
@@ -1668,6 +1668,7 @@ impl App {
             category_dlg: None,
             category_for_file_info: false,
             grabber: None,
+            link_parts: Default::default(),
             assistive_checked: None,
             extracts: Default::default(),
             queue_pick: None,
@@ -1722,10 +1723,9 @@ impl App {
             importing: Default::default(),
             save_failed: None,
             moving: Vec::new(),
-            renaming_torrents: Vec::new(),
+            renaming: Vec::new(),
             deferred_torrent_queue,
             turn_off: None,
-            exit_requested: false,
             global: std::sync::Arc::new(mdm_engine::limiter::Limiter::new(None)),
             host_limits: Default::default(),
             quota: Default::default(),
@@ -2980,6 +2980,22 @@ impl App {
             self.select_download_of(address);
             return;
         }
+        // The browser's right-click menu's links: a long list comes in parts (the browser hands
+        // over 1 MB a message), kept until the last is in, then shown as one list.
+        let cmd = if cmd.links_part.is_some() {
+            match self.link_parts.add(cmd, Instant::now()) {
+                crate::linkparts::Placed::Whole(whole) if !whole.links.is_empty() => *whole,
+                crate::linkparts::Placed::Waiting { got, count } => {
+                    tracing::debug!(
+                        "browser integration: {got} of {count} parts of a page's links"
+                    );
+                    return;
+                }
+                _ => return,
+            }
+        } else {
+            cmd
+        };
         // The browser's right-click menu: a page's (or a selection's) links, to tick in Import.
         if !cmd.links.is_empty() {
             self.show_for_dialog(ctx);
@@ -4081,18 +4097,20 @@ impl App {
         // closing closes, as any window's does: Options' "Keep running when closing the window"
         // off, no tray at all, or Linux with no tray host (#59: a hidden window couldn't come
         // back, and one that merely minimized could never be closed).
-        if !self.exiting && ctx.input(|i| i.viewport().close_requested()) {
+        // Asked to quit (`quit`: File → Exit, Exit when done…), the close quits whatever the option.
+        if ctx.input(|i| i.viewport().close_requested()) {
             use crate::tray::OnClose;
+            let quitting = self.exiting;
             let keep = self.settings.close_to_tray;
             let tray = self.tray.is_some();
             // The shell's answer, only when it matters (macOS: asked afresh).
-            let icon = if keep && tray {
+            let icon = if keep && tray && !quitting {
                 self.tray_icon_now()
             } else {
                 crate::tray::Icon::Gone
             };
             let taskbar = cfg!(not(target_os = "linux"));
-            match crate::tray::on_close(keep, tray, icon, taskbar) {
+            match crate::tray::on_close(quitting, keep, tray, icon, taskbar) {
                 OnClose::Hide => {
                     tracing::info!("close: hidden to the notification area (tray icon: {icon:?})");
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -4446,6 +4464,23 @@ impl App {
             self.dirty = true;
             return false;
         }
+        let Some(spec) = torrent_spec else {
+            // A file or a folder of MDM's own: renamed on a thread of its own (#1103), as a disk
+            // slow to answer would hold the window meanwhile; `poll_deferred_torrent_renames`
+            // takes the answer. Cleared now, as for a torrent below.
+            let side = self.item(id).map(|i| {
+                i.rename_on_complete = None;
+                i.side_files.clone()
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::launch::spawn("rename", move || {
+                let side = side.unwrap_or_default();
+                let _ = tx.send((rename_finished(&from, &desired, is_dir, &side), None));
+            });
+            self.renaming.push((id, rx));
+            self.dirty = true;
+            return true;
+        };
         let Some((initial_to, hold)) =
             crate::deferred_rename::reserve_target_path(&from, &desired, is_dir)
         else {
@@ -4455,72 +4490,48 @@ impl App {
             self.dirty = true;
             return false;
         };
-        if let Some(spec) = torrent_spec {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let known = self.session_hashes();
-            match self.torrent_host.rename_finished(
-                &self.rt,
-                known,
-                &spec,
-                from.clone(),
-                initial_to,
-                hold,
-                is_dir,
-                self.settings.torrent_keep_sharing,
-                tx,
-            ) {
-                Ok(()) => {
-                    // Clear before the background rename moves the folder so an abrupt exit
-                    // never leaves a stale `rename_on_complete` pointing at the old `dest`.
-                    if let Some(item) = self.item(id) {
-                        item.rename_on_complete = None;
-                    }
-                    self.renaming_torrents.push((id, from, rx));
-                    self.dirty = true;
-                    return true;
-                }
-                Err(hold) => {
-                    drop(hold);
-                    // Keep `item.rename_on_complete` persisted in `downloads.json` while waiting
-                    // for `torrent_host` so quitting MDM before it starts does not lose it.
-                    if !self.deferred_torrent_queue.contains(&id) {
-                        self.deferred_torrent_queue.push(id);
-                    }
-                    self.dirty = true;
-                    return true;
-                }
-            }
-        }
-        match crate::deferred_rename::rename_reserved_or_number(&from, initial_to, hold, is_dir) {
-            Ok(actual_to) => {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let known = self.session_hashes();
+        match self.torrent_host.rename_finished(
+            &self.rt,
+            known,
+            &spec,
+            from.clone(),
+            initial_to,
+            hold,
+            is_dir,
+            self.settings.torrent_keep_sharing,
+            tx,
+        ) {
+            Ok(()) => {
+                // Clear before the background rename moves the folder so an abrupt exit
+                // never leaves a stale `rename_on_complete` pointing at the old `dest`.
                 if let Some(item) = self.item(id) {
                     item.rename_on_complete = None;
-                    apply_renamed_paths_to_pending_mark(item, &from, &actual_to, is_dir);
-                    take_place(item, actual_to);
                 }
+                self.renaming.push((id, rx));
                 self.dirty = true;
+                true
             }
-            Err(e) => {
-                let err = e.to_string();
-                let msg = crate::i18n::fmt(
-                    crate::i18n::t("The file could not be moved: {error}"),
-                    &[("error", &err)],
-                );
-                if let Some(item) = self.item(id) {
-                    item.rename_on_complete = None;
-                    item.note(msg.clone());
+            Err(hold) => {
+                drop(hold);
+                // Keep `item.rename_on_complete` persisted in `downloads.json` while waiting
+                // for `torrent_host` so quitting MDM before it starts does not lose it.
+                if !self.deferred_torrent_queue.contains(&id) {
+                    self.deferred_torrent_queue.push(id);
                 }
-                self.notice = Some((crate::i18n::mark("Move/Rename"), msg));
                 self.dirty = true;
+                true
             }
         }
-        false
     }
 
-    fn apply_finished_torrent_rename(
+    /// A finished download's rename on completion (a file's or a torrent's, each on a thread of
+    /// its own) is done: the row follows the new name, then its archive is extracted
+    /// (`notify_ui`; not while MDM exits).
+    fn apply_finished_rename(
         &mut self,
         id: u64,
-        from: &std::path::Path,
         r: Result<PathBuf, String>,
         sharing_error: Option<String>,
         notify_ui: bool,
@@ -4529,8 +4540,6 @@ impl App {
             Ok(actual_to) => {
                 if let Some(item) = self.item(id) {
                     item.rename_on_complete = None;
-                    let is_dir = crate::deferred_rename::is_folder_target(item);
-                    apply_renamed_paths_to_pending_mark(item, from, &actual_to, is_dir);
                     take_place(item, actual_to.clone());
                 }
                 for c in &mut self.complete {
@@ -4565,7 +4574,6 @@ impl App {
             ));
             self.dirty = true;
         }
-        self.flush_pending_mark(id);
         if notify_ui {
             self.extracts.finished(id, &self.items, &self.settings);
         }
@@ -4586,10 +4594,9 @@ impl App {
                     if !self.deferred_torrent_queue.contains(&id) {
                         self.deferred_torrent_queue.push(id);
                     }
-                } else if !self.renaming_torrents.iter().any(|(rid, _, _)| *rid == id) {
-                    let torrent_renaming = self.apply_deferred_rename(id);
-                    if !torrent_renaming {
-                        self.flush_pending_mark(id);
+                } else if !self.renaming.iter().any(|(rid, _)| *rid == id) {
+                    let renaming = self.apply_deferred_rename(id);
+                    if !renaming {
                         self.extracts.finished(id, &self.items, &self.settings);
                     }
                 }
@@ -4597,32 +4604,16 @@ impl App {
         }
 
         let mut done = Vec::new();
-        self.renaming_torrents
-            .retain(|(id, from, rx)| match rx.try_recv() {
-                Ok(r) => {
-                    done.push((*id, from.clone(), r));
-                    false
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => true,
-                Err(_) => false,
-            });
-        for (id, from, (r, sharing_error)) in done {
-            self.apply_finished_torrent_rename(id, &from, r, sharing_error, true);
-        }
-    }
-
-    fn flush_pending_mark(&mut self, id: u64) {
-        let Some(pm) = self.item(id).and_then(|i| i.pending_mark.take()) else {
-            return;
-        };
-        let files: Vec<PathBuf> = pm
-            .main_file
-            .into_iter()
-            .chain(pm.side_files)
-            .chain(pm.gallery_files)
-            .collect();
-        if !files.is_empty() {
-            mark_finished(files, pm.url, pm.referer);
+        self.renaming.retain(|(id, rx)| match rx.try_recv() {
+            Ok(r) => {
+                done.push((*id, r));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(_) => false,
+        });
+        for (id, (r, sharing_error)) in done {
+            self.apply_finished_rename(id, r, sharing_error, true);
         }
     }
 
@@ -4685,16 +4676,23 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "video".into());
         // yt-dlp takes any `<stem>.*` there as its own: a stem no file and no other download
-        // in the folder has, whatever the extension (#32).
+        // in the folder has, whatever the extension (#32). The page's title is shortened to
+        // fit the path limits with the files the video has beside it; a name the user typed is
+        // kept as typed (#1102).
         let items = &self.items;
-        let dest = mdm_engine::naming::stem_destination(&folder, &name, |stem| {
+        let in_use = |stem: &str| {
             items.iter().any(|i| {
                 i.dest.parent() == Some(folder.as_path())
                     && i.dest
                         .file_stem()
                         .is_some_and(|s| s.to_string_lossy().to_lowercase() == stem.to_lowercase())
             })
-        });
+        };
+        let dest = if add.named {
+            mdm_engine::naming::typed_stem_destination(&folder, &name, in_use)
+        } else {
+            mdm_engine::naming::stem_destination(&folder, &name, in_use)
+        };
         let id = self.push_item(
             add.page,
             dest,
@@ -4711,6 +4709,7 @@ impl App {
                 selector: add.selector,
                 subs: add.subs,
                 parts: Vec::new(),
+                named: add.named,
             });
             // The quality menu's look-up goes with this new download only, started now and while
             // fresh: one queued for later, or added on a duplicate question answered late,
@@ -4837,6 +4836,7 @@ impl App {
                     selector: add.selector.clone(),
                     subs: Default::default(),
                     parts: Vec::new(),
+                    named: false,
                 });
             }
             ids.push(id);
@@ -4937,6 +4937,7 @@ impl App {
             &spec.subs,
             preloaded,
             engine,
+            Some(mark_hook(&item.url, item.context.referer.as_deref())),
         );
         match started {
             Ok(job) => {
@@ -4955,7 +4956,14 @@ impl App {
             }
             Err(e) => {
                 item.status = Status::Error;
-                item.error = Some(e.to_string());
+                item.error = Some(match e {
+                    // Its files would pass the path limits (#1102): said in the interface's
+                    // language, with the video's path.
+                    mdm_tools::proc::ProcError::PathTooLong(_) => {
+                        crate::errors::describe(&mdm_engine::Error::PathTooLong(item.dest.clone()))
+                    }
+                    e => e.to_string(),
+                });
             }
         }
         self.dirty = true;
@@ -5039,6 +5047,7 @@ impl App {
             &ask,
             &crate::videodlg::from_browser(&item.context),
             engine,
+            Some(mark_hook(&item.url, None)),
         );
         match started {
             Ok(job) => {
@@ -5074,6 +5083,44 @@ impl App {
             .iter()
             .filter_map(|i| i.torrent.as_ref().map(|t| t.hash.clone()))
             .collect()
+    }
+
+    /// Torrent settings' switch just turned on (#1091): when Windows still opens magnet links or
+    /// .torrent files with another program (a choice in Default apps, which no program may
+    /// change), say which and open Settings at MDM's Default apps page, where the user picks it.
+    /// An instance off the screens (a test's) never asks this computer: it takes the names in
+    /// MDM_TEST_TORRENT_DEFAULTS (`;` between them), and its log says what would have opened.
+    #[cfg(windows)]
+    fn tell_torrent_defaults(&mut self) {
+        let others = if crate::offscreen() {
+            std::env::var("MDM_TEST_TORRENT_DEFAULTS")
+                .unwrap_or_default()
+                .split(';')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .collect()
+        } else {
+            crate::win32::torrent_defaults_elsewhere()
+        };
+        if others.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "torrents: Windows opens magnet links or .torrent files with {}",
+            others.join(", ")
+        );
+        self.notice = Some((
+            crate::i18n::mark("Torrent settings"),
+            crate::i18n::fmt(
+                // i18n: after ticking "Open magnet links and .torrent files with Mister Download Manager", when Windows' Default apps keeps another app; {apps}: their names. "MAGNET" as Windows' Default apps lists it
+                crate::i18n::t(
+                    "Windows still opens magnet links or .torrent files with {apps}, chosen in Windows' Default apps, where only you can change it. Settings opens there now: pick Mister Download Manager for MAGNET and .torrent.",
+                ),
+                &[("apps", &crate::i18n::isolate(&others.join(", ")))],
+            ),
+        ));
+        crate::launch::open_page(&crate::win32::default_apps_page());
     }
 
     /// The hashes librqbit should keep or restore in its session.
@@ -6622,7 +6669,9 @@ impl App {
         if let Some(mode) = w.turn_off {
             self.turn_off = Some(dialogs::TurnOffCountdown::new(mode, w.force));
         } else if w.exit {
-            self.exit_requested = true;
+            tracing::info!("when done: exit");
+            let ctx = self.ui_ctx.clone();
+            self.quit(&ctx);
         }
     }
 
@@ -6705,10 +6754,7 @@ impl App {
             .is_some_and(|i| i.moved_away);
         match cmd {
             Cmd::AddUrl => self.add_url = Some(AddUrl::from_clipboard(&self.settings.url_history)),
-            Cmd::Exit => {
-                self.exiting = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            Cmd::Exit => self.quit(ctx),
             Cmd::Stop => {
                 for id in many {
                     if self.item(id).is_some_and(|i| i.live.is_some()) {
@@ -7159,7 +7205,7 @@ impl App {
         self.poll_dragged_out();
         self.poll_deferred_torrent_renames();
         if !self.moving.is_empty()
-            || !self.renaming_torrents.is_empty()
+            || !self.renaming.is_empty()
             || !self.deferred_torrent_queue.is_empty()
         {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -7214,9 +7260,8 @@ impl App {
         for id in &finished {
             self.release_link(*id);
             self.failures.remove(id);
-            let torrent_renaming = self.apply_deferred_rename(*id);
-            if !torrent_renaming {
-                self.flush_pending_mark(*id);
+            let renaming = self.apply_deferred_rename(*id);
+            if !renaming {
                 // Its archive, when it is to be extracted and its last volume is in (#37).
                 self.extracts.finished(*id, &self.items, &self.settings);
             }
@@ -10372,9 +10417,6 @@ impl App {
         {
             self.limit_notice = None;
         }
-        if std::mem::take(&mut self.exit_requested) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         if let Some(t) = &mut self.turn_off {
             match t.show(ctx) {
                 Outcome::Open => {}
@@ -10455,8 +10497,40 @@ impl App {
         }
         if !self.torrents_started {
             self.torrents_started = true;
-            // The handlers follow the exe (a portable copy may have moved).
-            if self.settings.torrent_associations {
+            // Torrent settings' switch never decided (a list from before #1058, a new one):
+            // settled once, as the user chose (the installer's task, an earlier tick, or what the
+            // system opens .torrent files with now), and saved for the browser integration. An
+            // instance off the screens (a test's, MDM_OFFSCREEN) never reads this computer's
+            // installer value or associations: off, unless its list ticked it before.
+            if self.settings.torrent_associations.is_none() {
+                let system = !crate::offscreen();
+                #[cfg(windows)]
+                let installer = (system && mdm_ipc::portable_dir().is_none())
+                    .then(crate::win32::install_torrents)
+                    .flatten();
+                #[cfg(not(windows))]
+                let installer: Option<bool> = None;
+                let registered = || {
+                    #[cfg(windows)]
+                    return system && crate::win32::torrent_handler_is_ours();
+                    #[cfg(unix)]
+                    return system && crate::unix::torrent_handler_is_ours();
+                };
+                if self.settings.settle_torrent_handler(installer, registered) {
+                    tracing::info!(
+                        "torrents: Open magnet links and .torrent files with MDM settled {}",
+                        if self.settings.torrent_associations == Some(true) {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    self.dirty = true;
+                }
+            }
+            // The handlers follow the exe (a portable copy may have moved). Never from an
+            // instance off the screens (a test's build would take this computer's associations).
+            if self.settings.torrent_associations == Some(true) && !crate::offscreen() {
                 #[cfg(windows)]
                 crate::win32::set_torrent_handlers(true);
                 #[cfg(unix)]
@@ -10518,12 +10592,22 @@ impl App {
                             share,
                         );
                     }
-                    if assoc != self.settings.torrent_associations {
-                        self.settings.torrent_associations = assoc;
+                    if Some(assoc) != self.settings.torrent_associations {
+                        self.settings.torrent_associations = Some(assoc);
+                        // Not from an instance off the screens (a test's), as at start.
+                        if !crate::offscreen() {
+                            #[cfg(windows)]
+                            crate::win32::set_torrent_handlers(assoc);
+                            #[cfg(unix)]
+                            crate::unix::set_torrent_handlers(assoc);
+                        }
+                        // Windows: a choice recorded in Default apps for another program stays
+                        // first, and only the user can change it (#1091): MDM says so and opens
+                        // its page there. Linux and macOS: the switch made MDM the default.
                         #[cfg(windows)]
-                        crate::win32::set_torrent_handlers(assoc);
-                        #[cfg(unix)]
-                        crate::unix::set_torrent_handlers(assoc);
+                        if assoc {
+                            self.tell_torrent_defaults();
+                        }
                     }
                     self.dirty = true;
                 }
@@ -11094,15 +11178,29 @@ impl App {
         crate::crash::logic_begin();
         crate::crash::step(crate::crash::Step::Commands);
         let mut handled = false;
+        // A command that may open a window (not a question answered at once).
+        let mut opens = false;
         while let Ok(inc) = self.commands.try_recv() {
             handled = true;
             match inc.reply {
                 Some(reply) => {
                     let _ = reply.send(self.answer(&inc.cmd));
                 }
-                None => self.handle_command(inc.cmd, ctx),
+                None => {
+                    opens = true;
+                    self.handle_command(inc.cmd, ctx);
+                }
             }
         }
+        // macOS: hidden from the menu bar icon, the whole app is hidden and draws no window, so
+        // the window the command opens would never appear (the browser's Download video button
+        // did nothing). Unhide the app; the main window stays hidden.
+        #[cfg(target_os = "macos")]
+        if opens && !crate::offscreen() {
+            crate::unix::macos_unhide_app();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = opens;
         if handled {
             ctx.request_ui_pass(egui::ViewportId::ROOT);
         }
@@ -11179,7 +11277,7 @@ impl App {
         // The freeze watchdog times every frame's drawing, as it times its logic (crash.rs).
         crate::crash::frame_begin();
         // A lost graphics device is noticed before this frame paints (renderer.rs).
-        crate::renderer::frame_begin();
+        crate::renderer::frame_begin(ui.ctx());
         // Off-screen test runs: no window of ours may become the foreground one (win32.rs). Linux
         // and macOS need no such pass: their off-screen windows open inactive (main.rs `quiet`)
         // and nothing raises them then (dialogs::raise).
@@ -11338,10 +11436,10 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Let any in-flight torrent folder rename finish and update `item.dest` before saving.
-        for (id, from, rx) in std::mem::take(&mut self.renaming_torrents) {
+        // Let any rename on completion under way finish and update `item.dest` before saving.
+        for (id, rx) in std::mem::take(&mut self.renaming) {
             if let Ok((r, sharing_error)) = rx.recv_timeout(Duration::from_secs(2)) {
-                self.apply_finished_torrent_rename(id, &from, r, sharing_error, false);
+                self.apply_finished_rename(id, r, sharing_error, false);
             }
         }
         // An archive being extracted stops; its staging folder goes with it.
@@ -11545,6 +11643,7 @@ mod same_name_tests {
             selector: "b".into(),
             subs: Default::default(),
             parts: Vec::new(),
+            named: false,
         });
         let items = [row(1, &d.join("Master.webm"), Status::Stopped, 9), video];
         assert_eq!(
@@ -11813,6 +11912,7 @@ mod duplicate_tests {
                 label: "720p".into(),
                 merge: true,
             }),
+            named: false,
         }
     }
 
@@ -11845,6 +11945,7 @@ mod duplicate_tests {
             selector: SELECTOR.into(),
             subs: Default::default(),
             parts: Vec::new(),
+            named: false,
         });
         assert!(same_video(&item, &page(), SELECTOR));
         assert!(!same_video(
@@ -11966,6 +12067,7 @@ mod duplicate_tests {
             selector: SELECTOR.into(),
             subs: Default::default(),
             parts: Vec::new(),
+            named: false,
         });
         i
     }
@@ -12186,31 +12288,32 @@ mod window_thread_tests {
 }
 
 #[cfg(test)]
-mod mark_finished_tests {
-    /// #510: finished files are marked away from the window's thread; a file gone from its path
-    /// meanwhile (moved, deleted) isn't created again by the mark.
+mod mark_hook_tests {
+    /// #510, #1103: what a video's or a gallery's job shows its saved files to marks them as
+    /// downloaded from the web (an http(s) address only); a file gone from its path meanwhile
+    /// isn't created again by the mark (the jobs show only files that are there).
     #[test]
-    fn a_finished_file_is_marked_and_a_gone_one_is_not_created() {
+    fn a_saved_file_is_marked_from_a_web_address_only() {
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path().join("video.mp4");
+        let ftp = dir.path().join("listing.txt");
         std::fs::write(&here, b"x").unwrap();
-        let gone = dir.path().join("moved.mp4");
-        super::mark_finished(
-            vec![here.clone(), gone.clone()],
-            "https://videos.test/v".into(),
-            None,
-        )
-        .unwrap()
-        .join()
-        .unwrap();
-        assert!(!gone.exists(), "a moved file's old path stays empty");
+        std::fs::write(&ftp, b"x").unwrap();
+        let web = super::mark_hook(&"https://videos.test/v".parse().unwrap(), None);
+        (web.0)(&here);
+        let other = super::mark_hook(&"ftp://files.test/listing.txt".parse().unwrap(), None);
+        (other.0)(&ftp);
         #[cfg(windows)]
         {
-            let mut stream = here.as_os_str().to_owned();
-            stream.push(":Zone.Identifier");
-            let zone = std::fs::read_to_string(stream).unwrap();
-            assert!(zone.contains("ZoneId=3"), "{zone}");
-            assert!(zone.contains("HostUrl=https://videos.test/v"), "{zone}");
+            let zone = |p: &std::path::Path| {
+                let mut stream = p.as_os_str().to_owned();
+                stream.push(":Zone.Identifier");
+                std::fs::read_to_string(stream).ok()
+            };
+            let marked = zone(&here).unwrap();
+            assert!(marked.contains("ZoneId=3"), "{marked}");
+            assert!(marked.contains("HostUrl=https://videos.test/v"), "{marked}");
+            assert_eq!(zone(&ftp), None, "an FTP address may carry its login");
         }
     }
 }
@@ -12469,59 +12572,49 @@ mod deferred_rename_guard_tests {
         );
     }
 
+    /// #655, #1103: a rename on completion (on a thread of its own) takes a video's subtitles
+    /// along, and a gallery's folder its pictures; the mark each got before it was done goes
+    /// with them.
     #[test]
-    fn pending_mark_updates_video_subtitles_and_gallery_paths_after_rename() {
+    fn a_rename_on_completion_takes_subtitles_and_the_mark_along() {
         let dir = tempfile::tempdir().unwrap();
         let from_vid = dir.path().join("raw_id.mp4");
         let sub_en = dir.path().join("raw_id.en.srt");
         std::fs::write(&from_vid, b"v").unwrap();
         std::fs::write(&sub_en, b"s").unwrap();
-
-        let mut vid_item = test_item(1, from_vid.clone());
-        vid_item.pending_mark = Some(model::PendingMark {
-            main_file: Some(from_vid.clone()),
-            side_files: vec![sub_en.clone()],
-            gallery_files: Vec::new(),
-            url: "https://videos.test/watch".into(),
-            referer: None,
-        });
-
-        let (initial_to, hold) =
-            crate::deferred_rename::reserve_target_path(&from_vid, "Talk 01", false).unwrap();
-        let actual_to =
-            crate::deferred_rename::rename_reserved_or_number(&from_vid, initial_to, hold, false)
-                .unwrap();
-        apply_renamed_paths_to_pending_mark(&mut vid_item, &from_vid, &actual_to, false);
-        let pm = vid_item.pending_mark.unwrap();
-        assert_eq!(pm.main_file, Some(dir.path().join("Talk 01.mp4")));
-        assert_eq!(pm.side_files, vec![dir.path().join("Talk 01.en.srt")]);
-        assert!(dir.path().join("Talk 01.en.srt").exists());
-        assert!(!sub_en.exists());
-
         let old_gal = dir.path().join("gal_raw");
         std::fs::create_dir_all(old_gal.join("sub")).unwrap();
         let img = old_gal.join("sub").join("01.png");
         std::fs::write(&img, b"img").unwrap();
-        let mut gal_item = test_item(2, old_gal.clone());
-        gal_item.gallery = Some(Default::default());
-        gal_item.pending_mark = Some(model::PendingMark {
-            main_file: None,
-            side_files: Vec::new(),
-            gallery_files: vec![img],
-            url: "https://gallery.test/a".into(),
-            referer: None,
-        });
-        let (g_to, g_hold) =
-            crate::deferred_rename::reserve_target_path(&old_gal, "Album 01", true).unwrap();
-        let actual_gal =
-            crate::deferred_rename::rename_reserved_or_number(&old_gal, g_to, g_hold, true)
-                .unwrap();
-        apply_renamed_paths_to_pending_mark(&mut gal_item, &old_gal, &actual_gal, true);
-        let gpm = gal_item.pending_mark.unwrap();
+        #[cfg(windows)]
+        for f in [&from_vid, &sub_en, &img] {
+            crate::win32::mark_downloaded(f, "https://videos.test/watch", None);
+        }
+
+        let to = rename_finished(&from_vid, "Talk 01", false, std::slice::from_ref(&sub_en));
+        assert_eq!(to, Ok(dir.path().join("Talk 01.mp4")));
+        assert!(dir.path().join("Talk 01.en.srt").exists());
+        assert!(!from_vid.exists() && !sub_en.exists());
+
+        let to = rename_finished(&old_gal, "Album 01", true, &[]);
+        assert_eq!(to, Ok(dir.path().join("Album 01")));
+        let moved_img = dir.path().join("Album 01").join("sub").join("01.png");
+        assert!(moved_img.exists());
+
+        // Nothing to rename (the same name): the path stays.
+        let same = dir.path().join("Talk 01.mp4");
         assert_eq!(
-            gpm.gallery_files,
-            vec![dir.path().join("Album 01").join("sub").join("01.png")]
+            rename_finished(&same, "Talk 01", false, &[]),
+            Ok(same.clone())
         );
+
+        #[cfg(windows)]
+        for f in [&same, &dir.path().join("Talk 01.en.srt"), &moved_img] {
+            let mut stream = f.as_os_str().to_owned();
+            stream.push(":Zone.Identifier");
+            let zone = std::fs::read_to_string(stream).unwrap_or_default();
+            assert!(zone.contains("ZoneId=3"), "{}: {zone}", f.display());
+        }
     }
 }
 

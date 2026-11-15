@@ -687,12 +687,22 @@ mod tests {
         own.prepare(tmp.path(), &root, &root, Some(&[0])).unwrap();
         // The engine allocates storage for unticked files as well as selected ones.
         std::fs::write(root.join("unticked.bin"), b"engine-created storage").unwrap();
-        let reloaded: Ownership = serde_json::from_str(&serde_json::to_string(&own).unwrap()).unwrap();
-        reloaded.prepare(tmp.path(), &root, &root, Some(&[0, 1])).unwrap();
-        reloaded.prepare(tmp.path(), &root, &root, Some(&[0, 1])).unwrap();
-        reloaded.delete(tmp.path(), &root, &root, Some(&[0, 1]), true, &[]).unwrap();
+        let reloaded: Ownership =
+            serde_json::from_str(&serde_json::to_string(&own).unwrap()).unwrap();
+        reloaded
+            .prepare(tmp.path(), &root, &root, Some(&[0, 1]))
+            .unwrap();
+        reloaded
+            .prepare(tmp.path(), &root, &root, Some(&[0, 1]))
+            .unwrap();
+        reloaded
+            .delete(tmp.path(), &root, &root, Some(&[0, 1]), true, &[])
+            .unwrap();
         assert!(!root.join("selected.bin").exists());
-        assert_eq!(std::fs::read(root.join("unticked.bin")).unwrap(), b"engine-created storage");
+        assert_eq!(
+            std::fs::read(root.join("unticked.bin")).unwrap(),
+            b"engine-created storage"
+        );
     }
 
     #[test]
@@ -711,8 +721,12 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::rename(&original, &path).unwrap();
         own.prepare(tmp.path(), &root, &root, None).unwrap();
-        own.delete(tmp.path(), &root, &root, None, true, &[]).unwrap();
-        assert!(path.exists(), "protection is durable even if the old object returns");
+        own.delete(tmp.path(), &root, &root, None, true, &[])
+            .unwrap();
+        assert!(
+            path.exists(),
+            "protection is durable even if the old object returns"
+        );
         assert!(!root.join("other.bin").exists());
     }
 }

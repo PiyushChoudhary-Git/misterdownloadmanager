@@ -18,10 +18,15 @@
 // do with each new type, as Waterfox is: caught before its dialog, #208), cookie (cookies and referrer
 // forwarded), startedfrom (the page a download was started from goes whole, where its Referer is
 // the site's address only; kept with the download for Refresh download address, #607), names
-// (Content-Disposition), redirect, leadon (a page going to the file by script, #374), form (POST, 303), alt (Alt+click leaves it
+// (Content-Disposition), torrents (a tracker's .torrent stays with the browser
+// while Torrent settings leave torrents alone, #1058), redirect, leadon (a page going to the file by script, #374), form (POST, 303), alt (Alt+click leaves it
 // to the browser: a link, a redirect, a page's script; Firefox's own default too, #332), sites (a listed
-// site's page linking to a file on another host leaves it to the browser, #1049), opened (a PDF or MP3 the browser would show or play), openedNames
-// (such a video under its server's name, inline or an attachment, #948), spot (the video button
+// site's page linking to a file on another host leaves it to the browser, #1049), manylinks
+// (Download all links on a page of 20,000 long links, in parts, to one Link grabber list), opened
+// (a PDF or MP3 the browser would show or play), openedNames
+// (such a video under its server's name, inline or an attachment, #948), pdfs (a PDF a page shows: at a signed address, typed
+// binary/octet-stream, behind a redirect, in a frame, an embed, an object; one the page's script fetches stays the page's;
+// #1087), spot (the video button
 // clear of the page's controls, #421), feeds (a video in a feed sends its post, its own file, or
 // nothing and says so, never the feed: sample pages served at LinkedIn's, Facebook's, X's,
 // Instagram's, Reddit's, TikTok's, Vimeo's, Dailymotion's addresses, #689), preview (the video button kept over a hover-to-play
@@ -36,7 +41,8 @@
 // scripted (a video a server's program sends, named after its page with its real type: the list,
 // the button, the Download video window; #695, #800), guarded (a stream another site's server
 // serves to its page's player only: looked up and downloaded with the Origin and Referer the
-// browser sent, #900),
+// browser sent, #900), played (a feed whose page names no video: the file and the stream the tab
+// played for each video, found by its length, downloaded by MDM; never the next video, #1092),
 // qualities (the button's menu: a stream's qualities looked up by MDM, with their sizes; the one
 // picked downloads with its progress window only, MDM's main window hidden), page (the menu on a
 // real video page, E2E_VIDEO_PAGE, and the line E2E_VIDEO_PICK downloaded: off by default), video (shown,
@@ -57,7 +63,8 @@
 // case saves <lang>-looking.png, <lang>-video-tab.png and <lang>-audio-tab.png there (the player and
 // the menu), before the pick, and the `scripted` case <lang>-media-list.png (the popup's list) and
 // <lang>-video-window.png. Neither changes anything when unset. E2E_APP_LANG sets MDM's own language
-// (the words it sends the menu).
+// (the words it sends the menu). E2E_COLOR_SCHEME=light|dark shows the pages (the video button with
+// them) and the popup in those colours.
 //
 // Windows: the host is registered for the current user while it runs (nmhost --register, as the
 // installer does) and unregistered at the end. Every registry key that touches (the browsers'
@@ -395,6 +402,10 @@ async function chromium(bin, profile, dl, page, ready) {
     const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
     await cdp.send("Page.enable", {}, sessionId);
+    // E2E_COLOR_SCHEME (light or dark): the page in those colours, and the video button with it.
+    if (process.env.E2E_COLOR_SCHEME) {
+      await cdp.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: process.env.E2E_COLOR_SCHEME }] }, sessionId);
+    }
     const evaluate = async (expression) => {
       const r = await cdp.send("Runtime.evaluate", { expression, userGesture: true, awaitPromise: true, returnByValue: true }, sessionId);
       if (r.exceptionDetails) throw new Error(`evaluate: ${r.exceptionDetails.text} ${expression}`);
@@ -1567,6 +1578,23 @@ const PANEL_KEPT_MS = 5000 + 1500;
 // Options → General → Download panels, changed as its OK does: the settings saved in
 // downloads.json, which the host reads at each question. Changed with the app stopped, so its own
 // next save doesn't put them back.
+// The extension holding Options' excluded sites with localhost in them or not (it asks them
+// again as its popup opens; else only a minute after it last did, at a download): Chromium's rule
+// for the files the browser would open follows them.
+async function localhostListed(t, listed) {
+  const popup = await t.session.tab(`${t.session.base}popup.html`);
+  try {
+    await until(`the extension's excluded sites ${listed ? "with" : "without"} localhost`, 10000, () =>
+      popup
+        .evaluate(`(globalThis.browser ?? chrome).storage.local.get({ rules: null }).then((v) => Boolean(v.rules) && (v.rules.excludedSites || "").split(/\\s+/).includes("localhost") === ${listed})`)
+        .catch(() => false),
+    );
+    await sleep(300);
+  } finally {
+    await popup.close();
+  }
+}
+
 async function panelSettings(change) {
   await stopApp();
   const file = path.join(data, "downloads.json");
@@ -2097,6 +2125,96 @@ const CASES = {
     return `${plain}, ${star}, ${raw}`;
   },
 
+  // #1058: a .torrent from a tracker's download.php (named by Content-Disposition, sent as
+  // application/x-bittorrent) stays with the browser while Torrent settings' "Open magnet links
+  // and .torrent files with Mister Download Manager" is off, as by default, though TORRENT is in
+  // File types (it is in this run's list); with it on, MDM takes it (its Add torrent fetches it)
+  // and the browser keeps nothing.
+  async torrents(t) {
+    const p = `/gen/16K/tracker-${t.name}/download.php`;
+    const link = (name) => `${p}?id=42&cd=${encodeURIComponent(name)}&type=${encodeURIComponent("application/x-bittorrent")}`;
+    const off = `e2e-show-${t.name}.torrent`;
+    await clickLink(t, link(off));
+    const at = path.join(t.dl, off);
+    try {
+      await until(`${off} in the browser's folder`, 20000, () => fs.existsSync(at) && fs.statSync(at).size === 16 << 10);
+    } catch (e) {
+      e.message += ` (requests: ${(await requests(p)).map(brief).join("; ") || "none"}; the browser's folder: ${fs.readdirSync(t.dl).join(", ") || "empty"})`;
+      throw e;
+    }
+    await sleep(2000);
+    const asked = await requests(p);
+    if (asked.length !== 1) throw new Error(`off: ${asked.length} requests (only the browser's expected): ${asked.map(brief).join("; ")}`);
+    if ((await mdmList()).some((d) => d.file === off)) throw new Error("off: MDM took it too");
+    if (WIN && appWindows(appPid()).includes("Add torrent")) throw new Error("off: Add torrent opened");
+    // MDM's log says why (the host's line, or the extension's notice it wrote down).
+    const logged = () => {
+      const file = path.join(data, "logs", "mdm.log");
+      const log = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+      return log.split(/\r?\n/).find((l) => l.includes(off) && l.includes("Torrent settings"));
+    };
+    const why = await until("MDM's log line for it", 10000, logged).catch(() => {
+      throw new Error("off: MDM's log doesn't say why it stayed with the browser");
+    });
+    fs.rmSync(at);
+    // E2E_SHOTS (Chromium): <lang>-<scheme>-torrent-left.png, the popup saying why.
+    const shots = process.env.E2E_SHOTS ? path.resolve(process.env.E2E_SHOTS) : "";
+    const tag = `${process.env.E2E_LANG || "en"}-${process.env.E2E_COLOR_SCHEME || "system"}`;
+    if (shots && t.session.tab) {
+      const popup = await t.session.tab(`${t.session.base}popup.html`);
+      try {
+        const said = await until("the popup's reason", 10000, () =>
+          popup.evaluate(`(() => { const b = document.getElementById("declined"); return b && !b.hidden && document.getElementById("declined-why").textContent; })()`).catch(() => ""),
+        );
+        await sleep(500);
+        await popup.shot(path.join(shots, `${tag}-torrent-left.png`));
+        if (!said) throw new Error("the popup gives no reason");
+      } finally {
+        await popup.close();
+      }
+    }
+    // On: the extension learns it at its next question for the rules (Chromium: asked now;
+    // Firefox: once its copy is a minute old).
+    await panelSettings({ torrent_handler: true });
+    try {
+      if (t.session.inExtension) await t.session.inExtension("refreshRules().then(() => true)");
+      else {
+        await sleep(61000);
+        const primer = `e2e-primer-${t.name}.torrent`;
+        await clickLink(t, link(primer));
+        await until(`${primer} in the browser's folder`, 20000, () => fs.existsSync(path.join(t.dl, primer)));
+        await sleep(2000);
+        fs.rmSync(path.join(t.dl, primer), { force: true });
+      }
+      await clearLog();
+      const on = `e2e-show-on-${t.name}.torrent`;
+      await clickLink(t, link(on));
+      // Add torrent fetches it with the browser's request (MDM's own request after the browser's).
+      // The app started again with the setting (panelSettings): its process now.
+      const pid = WIN ? appPid() : 0;
+      await until("MDM's request for it", 20000, async () => (await requests(p)).length >= 2);
+      if (WIN) {
+        await until("Add torrent", 15000, () => appWindows(pid).includes("Add torrent")).catch((e) => {
+          e.message += ` (its windows: ${JSON.stringify(appWindows(pid))})`;
+          throw e;
+        });
+        // E2E_SHOTS: <lang>-<scheme>-torrent-taken.png, Add torrent as the browser's .torrent
+        // opens it (what the setting off did too, before #1058).
+        if (shots) {
+          await sleep(3000);
+          const cap = path.join(root, "tools", "lab", "cap-own.ps1");
+          spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", cap, "-ProcessId", String(pid), "-Title", "Add torrent", "-Out", path.join(shots, `${tag}-torrent-taken.png`)], { stdio: "ignore" });
+        }
+        appWindows(pid, "Add torrent");
+        await until("Add torrent closed", 5000, () => !appWindows(pid).includes("Add torrent"));
+      }
+      await keptNothing(t.dl);
+    } finally {
+      await panelSettings({ torrent_handler: false });
+    }
+    return `off: the browser kept ${off}, MDM's log says why (${why.split(": ").slice(-1)[0].slice(0, 60)}...); on: Add torrent fetched it, the browser kept nothing`;
+  },
+
   // A redirect: MDM keeps the address clicked (it asks it again to renew the link).
   async redirect(t) {
     const file = `e2e-r-${t.name}.zip`;
@@ -2229,6 +2347,83 @@ const CASES = {
     return "a file on 127.0.0.1 linked from a listed site's page (localhost): the browser's, MDM untouched";
   },
 
+  // Download all links on a page of 20,000 links with long paths (E2E_MANY_LINKS: another
+  // number), about 5 MB of them, past the 1 MB a message to the host may be: sent in parts, they
+  // open in Link grabber as one list, every link once, and nothing opens the help page. Firefox's
+  // right-click menu is opened and its item chosen; Chromium's can't be opened headless, so its
+  // handler is called as the menu calls it.
+  async manylinks(t) {
+    const n = Number(process.env.E2E_MANY_LINKS || 20000);
+    const page = `${LAB}/page?files=${n}&pathlen=200&title=many`;
+    await t.session.navigate(page);
+    const log = path.join(data, "logs", "mdm.log");
+    const from = fs.existsSync(log) ? fs.statSync(log).size : 0;
+    const label = "Download all links with Mister Download Manager";
+    const help = "https://misterdownloadmanager.com/help/browser-help.html";
+    // The tabs open now (the help page's, when the extension explains a failure).
+    const tabs = () =>
+      t.kind === "chromium"
+        ? t.session.inExtension(`chrome.tabs.query({}).then((ts) => ts.map((x) => x.pendingUrl || x.url || ""))`)
+        : t.session.inBrowser(`[...gBrowser.tabs].map((x) => x.linkedBrowser.currentURI.spec || "")`);
+    const started = Date.now();
+    let clicked;
+    if (t.kind === "chromium") {
+      clicked = await t.session.inExtension(`(async () => {
+        const tab = (await chrome.tabs.query({})).find((x) => x.url === ${JSON.stringify(page)});
+        if (!tab) return "no tab";
+        await menuClicked({ menuItemId: "mdm-all", pageUrl: tab.url, frameId: 0 }, tab);
+        const { status } = await chrome.storage.local.get("status");
+        return "called; status " + JSON.stringify(status && status.why) + ", badge " + JSON.stringify(await chrome.action.getBadgeText({}));
+      })()`);
+    } else {
+      const at = await t.session.evaluate(`(() => { const b = document.getElementById("blank").getBoundingClientRect(); return [b.left + 4, b.top + b.height / 2]; })()`);
+      clicked = await t.session.menu(at[0], at[1], label);
+      if (!String(clicked).startsWith("chosen")) throw new Error(`the menu: ${clicked}`);
+    }
+    // E2E_OLD_APP (a released app and its host, which know no parts): each part reaches Link
+    // grabber as a list of its own, and nothing says why (no line in its log): it opens, and no
+    // help page does.
+    if (process.env.E2E_OLD_APP) {
+      if (!WIN) throw new Skip(NO_UIA);
+      const pid = ourApps()[0];
+      const shown = await until("Link grabber", 120000, async () => (await tabs()).some((u) => u.startsWith(help)) ? ["help"] : appWindows(pid).includes("Link grabber") && appWindows(pid));
+      if (shown[0] === "help") throw new Error(`the help page opened: ${(await tabs()).join(", ")} (${clicked})`);
+      await sleep(3000);
+      if ((await tabs()).some((u) => u.startsWith(help))) throw new Error(`the help page opened: ${(await tabs()).join(", ")}`);
+      await stopApp();
+      return `an older app: Link grabber opened (${shown.join(", ")}), no help page in ${((Date.now() - started) / 1000).toFixed(1)} s (${clicked})`;
+    }
+    // The app's line once the list is whole (crates/app/src/linkparts.rs), or the help page.
+    const said = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").slice(from) : "");
+    const whole = new RegExp(`a page's (\\d+) links came in (\\d+) parts`);
+    let got = null;
+    try {
+      got = await until("the page's links in MDM", 90000, async () => whole.exec(said()) || ((await tabs()).some((u) => u.startsWith(help)) && "help"));
+    } catch (e) {
+      e.message += ` (${clicked}; tabs: ${(await tabs()).join(", ")})`;
+      throw e;
+    }
+    const open = await tabs();
+    if (got === "help") throw new Error(`the help page opened instead: ${open.filter((u) => u.startsWith(help)).join(", ")} (${clicked})`);
+    const [, links, parts] = got.map(Number);
+    if (links !== n) throw new Error(`${links} links reached MDM, not ${n} (${parts} parts)`);
+    if (parts < 2) throw new Error(`in ${parts} part: the test's list should need more`);
+    const ms = Date.now() - started;
+    let windows = "";
+    if (WIN) {
+      const pid = ourApps()[0];
+      const shown = await until("Link grabber", 20000, () => appWindows(pid).includes("Link grabber") && appWindows(pid));
+      windows = `, windows: ${shown.join(", ")}`;
+      appWindows(pid, "Link grabber");
+    }
+    await sleep(1000);
+    const after = await tabs();
+    if (after.some((u) => u.startsWith(help))) throw new Error(`the help page opened too: ${after.join(", ")}`);
+    // Link grabber looks its links up: stopped with the app (the next case starts another).
+    await stopApp();
+    return `${links} links in ${parts} parts to Link grabber in ${(ms / 1000).toFixed(1)} s${windows}; no help page (${clicked})`;
+  },
+
   // Files the browser would show or play, made downloads, MDM's (Chromium 128+, Firefox): typed
   // into the address bar, the tab stays on its page. A PDF sent with "Content-Disposition:
   // inline; filename=..." (as many servers do), one sent without it, an MP3 sent inline.
@@ -2264,6 +2459,103 @@ const CASES = {
     }
     if (failed.length) throw new Error(`${failed.join(" | ")}${done.length ? ` (taken: ${done.join(", ")})` : ""}`);
     return `taken, the tab stayed: ${[...done, ...left].join(", ")}`;
+  },
+
+  // #1087: a PDF a page shows, as course sites deliver theirs from a CDN: a signed address (a
+  // query string), sent as S3's binary/octet-stream, behind a redirect to another host, in a
+  // frame (of the page's host and of another), an <embed> and an <object>: MDM's, the page
+  // stays. A PDF the page's script fetches and shows itself (its own viewer) stays the page's:
+  // taken, the page would get nothing. A listed site's frame stays the browser's (#1049).
+  async pdfs(t) {
+    if (t.kind === "chromium" && t.session.major < 128) throw new Skip(`${t.name} ${t.session.major}: needs 128 (header conditions)`);
+    // Not the excluded sites a case before listed (the extension asks them only now and then).
+    await localhostListed(t, false);
+    // The page on localhost; the files on 127.0.0.1 (another host, as a CDN is; IDM, when it
+    // runs, leaves 127.0.0.1 alone).
+    const other = `http://localhost:${PORT}`;
+    const pdf = (f, more = "") => `${LAB}/gen/256K/${f}?inline=bare${more}`;
+    const framed = (tag) => (f) => ({ html: tag.replace("SRC", pdf(f)) });
+    const shapes = [
+      ["signed", (f) => ({ nav: pdf(f, "&Expires=1893456000&Signature=abc~def__&Key-Pair-Id=K2JCJMDEHXQW5F") })],
+      ["binary", (f) => ({ nav: pdf(f, "&type=binary/octet-stream") })],
+      ["redirect", (f) => ({ nav: `${other}/redirect?to=${encodeURIComponent(pdf(f))}` })],
+      ["iframe", framed('<iframe src="SRC" width=600 height=400></iframe>')],
+      ["xframe", (f) => ({ page: `${other}/page?link=none`, ...framed('<iframe src="SRC" width=600 height=400></iframe>')(f) })],
+      ["embed", framed('<embed src="SRC" type=application/pdf width=600 height=400>')],
+      ["object", framed('<object data="SRC" type=application/pdf width=600 height=400></object>')],
+    ];
+    const done = [];
+    const failed = [];
+    const clean = () => {
+      for (const f of fs.readdirSync(t.dl)) fs.rmSync(path.join(t.dl, f), { force: true, recursive: true });
+    };
+    for (const [label, make] of shapes) {
+      const file = `e2e-${label}-${t.name}.pdf`;
+      const s = make(file);
+      const page = s.page || `${LAB}/page?link=none`;
+      try {
+        await t.session.navigate(page);
+        if (s.nav) await t.session.navigate(s.nav, { download: true });
+        if (s.html) await t.session.evaluate(`(document.body.insertAdjacentHTML("beforeend", ${JSON.stringify(s.html)}), 1)`);
+        // The usual wait: a busy computer's Chromium has been seen to start such a download 10 s late.
+        await arrived(file, 256 << 10, "Documents");
+        const at = await t.session.evaluate("location.href");
+        if (at !== page) throw new Error(`the tab shows ${at}, not the page it was on`);
+        await keptNothing(t.dl);
+        done.push(label);
+      } catch (e) {
+        const log = (await requests(`/gen/256K/${file}`)).map(brief).join("; ");
+        failed.push(`${label}: ${e.message} [requests: ${log || "none"}; the browser's folder: ${fs.readdirSync(t.dl).join(", ") || "empty"}]`);
+        clean();
+      }
+    }
+    const left = [];
+    // The page's own viewer: it fetches the file and shows what it read (a blob).
+    {
+      const file = `e2e-fetched-${t.name}.pdf`;
+      try {
+        await t.session.navigate(`${LAB}/page?link=none`);
+        const got = await t.session.evaluate(
+          `fetch(${JSON.stringify(pdf(file))}).then((r) => r.blob()).then((b) => { const f = document.createElement("iframe"); f.src = URL.createObjectURL(b); document.body.append(f); return b.size; })`,
+        );
+        if (got !== 256 << 10) throw new Error(`the page read ${got} bytes`);
+        await sleep(3000);
+        const item = (await mdmList()).find((d) => d.file === file);
+        if (item) throw new Error(`MDM took it: ${item.status} ${item.path}`);
+        const all = await requests(`/gen/256K/${file}`);
+        if (all.length !== 1) throw new Error(`${all.length} requests (only the page's expected): ${all.map(brief).join("; ")}`);
+        await keptNothing(t.dl);
+        left.push("one the page fetched: the page's");
+      } catch (e) {
+        failed.push(`fetched: ${e.message}`);
+        clean();
+      }
+    }
+    // A listed site's frame (#1049): the browser shows it, MDM untouched.
+    {
+      const file = `e2e-listed-${t.name}.pdf`;
+      const saved = JSON.parse(fs.readFileSync(path.join(data, "downloads.json"), "utf8").replace(/^﻿/, ""));
+      const was = saved.settings.excluded_sites;
+      await panelSettings({ excluded_sites: "localhost" });
+      try {
+        await localhostListed(t, true);
+        await t.session.navigate(`${other}/page?link=none`);
+        await t.session.evaluate(`(document.body.insertAdjacentHTML("beforeend", ${JSON.stringify(`<iframe src="${pdf(file)}" width=600 height=400></iframe>`)}), 1)`);
+        await sleep(4000);
+        const item = (await mdmList()).find((d) => d.file === file);
+        if (item) throw new Error(`MDM took it: ${item.status} ${item.path}`);
+        await keptNothing(t.dl);
+        left.push("a listed site's frame: shown by the browser");
+      } catch (e) {
+        failed.push(`listed: ${e.message} [requests: ${(await requests(`/gen/256K/${file}`)).map(brief).join("; ") || "none"}]`);
+        clean();
+      } finally {
+        await panelSettings({ excluded_sites: was });
+        await localhostListed(t, false);
+      }
+    }
+    if (failed.length) throw new Error(`${failed.join(" | ")}${done.length ? ` (taken: ${done.join(", ")})` : ""}`);
+    return `taken, the page stayed: ${done.join(", ")}; ${left.join("; ")}`;
   },
 
   // #948: such a file under the server's own name, not its address's (`main.mp4`, `main.mkv`): one
@@ -3039,6 +3331,141 @@ const CASES = {
     }
   },
 
+  // #1092: a feed whose page names no video (/feed: yt-dlp finds none in it nor in its post's
+  // page), its players fed by the page (blob:): the button over each offers what the tab played
+  // for that video, found by its length. The first post's file, fetched in ranges: "Download best"
+  // its MP4, downloaded by MDM's engine with the feed as Referer; the second's HLS stream: its
+  // qualities, looked up by MDM, one picked and downloaded; the third, the next video, only begun:
+  // its own file, never the first's. E2E_SHOTS: <lang>-played-file.png and
+  // <lang>-played-stream.png (the player and its menu); with E2E_PLAYED_BEFORE=1 (an older
+  // extension, for a pull request's "before") <lang>-played-file-before.png and
+  // <lang>-played-stream-before.png only.
+  async played(t) {
+    if (!ytdlp) throw new Skip("no yt-dlp (E2E_YTDLP or PATH)");
+    if (!ffmpeg) throw new Skip("no ffmpeg (E2E_FFMPEG or PATH)");
+    await stopApp();
+    fs.rmSync(path.join(data, "ipc.json"), { force: true });
+    spawn(appExe, ["/startup"], { env: process.env, stdio: "ignore", detached: false });
+    try {
+      await until("the test instance, in the notification area", 20000, () => mdmList().then(() => true, () => false));
+      const s = t.session;
+      const FILE_A = "/gen/2M/feed-a.mp4";
+      // An earlier browser's downloads of these off the list (with their files).
+      const earlier = (await mdmList()).filter((d) => d.url.startsWith(`${LAB}${FILE_A}`) || d.url.startsWith(`${LAB}/hls/`)).map((d) => d.id);
+      if (earlier.length) await ipc({ action: "delete", ids: earlier });
+      await s.navigate(`${LAB}/feed`);
+      const state = await until("the feed's players", 30000, () => s.evaluate("document.body.dataset.feed || ''"));
+      if (state !== "done") throw new Error(`the feed's players: ${state} ${await s.evaluate("document.body.dataset.feedError || ''")}`);
+      const shots = process.env.E2E_SHOTS && s.shot ? path.resolve(process.env.E2E_SHOTS) : "";
+      const lang = process.env.E2E_LANG || "en";
+      // The button over `v`, the pointer brought onto it again a few times (MDM may be slow to say
+      // the button may show while it looks a video up).
+      const over = async (v) => {
+        for (let i = 0; i < 4; i++) {
+          const b = await hover(s, v);
+          if (b) return b;
+          await s.mouse(2, 2);
+          await sleep(1000);
+        }
+        return null;
+      };
+      // The button over `sel` with `chip`, its menu opened and filled (a picture of both: `shot`).
+      const menuOver = async (sel, chip, shot = "") => {
+        await s.mouse(2, 2);
+        await s.evaluate(`document.querySelector(${JSON.stringify(sel)}).scrollIntoView({ block: "center" })`);
+        await sleep(500);
+        const v = await rect(s, sel);
+        if (!(await over(v))) throw new Error(`${sel}: no button`);
+        // E2E_PLAYED_BEFORE=1: pictures of an older extension's menu there (a pull request's
+        // "before"), which never offers what played: its menu once its look-up ended, then no more.
+        // Its menu: its arrow (the pointer resting on the button starts its look-up, #1053), then
+        // what the look-up and what the tab played came to (a minute and a half at most).
+        await clickArrow(s);
+        const filled = (q) => q && !q.busy && (q.rows.length || q.note);
+        const said = new Set();
+        const m = await until(`${sel}: its menu`, 90000, async () => {
+          const q = await s.picks("row");
+          if (q) said.add(q.busy ? "looking" : q.note || q.rows.map((r) => r.name).join(", "));
+          return filled(q) ? q : null;
+        }).catch((e) => {
+          // An older extension may have nothing to say there (a feed's video no post names).
+          if (process.env.E2E_PLAYED_BEFORE) return null;
+          throw new Error(`${e.message} (it said: ${[...said].join(" | ")})`);
+        });
+        // E2E_PLAYED_BEFORE=1: pictures of an older extension's menu there (a pull request's
+        // "before"), which never offers what played.
+        if (process.env.E2E_PLAYED_BEFORE) {
+          await sleep(400);
+          const q = (await s.picks()) || m || { box: (await rect(s, "mdm-video-button")) || v };
+          if (shots && shot) await s.shot(path.join(shots, `${lang}-${shot}-before.png`), { l: Math.min(v.l, q.box.l) - 10, t: Math.min(v.t, q.box.t) - 10, r: Math.max(v.r, q.box.r) + 10, b: Math.max(v.b, q.box.b) + 10 });
+          return null;
+        }
+        if (!m.rows.length) throw new Error(`${sel}: its menu says "${m.note}"`);
+        const p = await s.pill(PILL_STATE);
+        if (!p || p.chip !== chip) throw new Error(`${sel}: the button's chip is "${p && p.chip}", not ${chip}`);
+        if (shots && shot) {
+          await sleep(400);
+          const q = await s.picks();
+          await s.shot(path.join(shots, `${lang}-${shot}.png`), { l: Math.min(v.l, q.box.l) - 10, t: Math.min(v.t, q.box.t) - 10, r: Math.max(v.r, q.box.r) + 10, b: Math.max(v.b, q.box.b) + 10 });
+        }
+        return { p, m };
+      };
+      // A size of `n` MB in the browser's language ("2 MB", "2 م.ب").
+      const megabytes = (size, n) => new RegExp(`^(${n}|${"٠١٢٣٤٥٦٧٨٩"[n]})\\s?\\S+$`).test(size.replace(/\u00a0/g, " "));
+      const rows = (m) => m.rows.map((r) => `${r.name}${r.size ? ` ${r.size}` : ""}`).join(", ");
+      // The first post: its file (2 MB, 360p MP4), its only line; the next video's (3 MB) never.
+      const one = await menuOver("#feed1", "360p", "played-file");
+      if (!one) {
+        await menuOver("#feed2", "720p", "played-stream");
+        throw new Skip("E2E_PLAYED_BEFORE: the older menus' pictures taken");
+      }
+      const top = one.m.rows[0];
+      if (one.m.rows.length !== 1 || top.kind !== "top" || !/\bMP4\b/.test(top.name) || !megabytes(top.size, 2)) {
+        throw new Error(`#feed1's menu: ${rows(one.m)}`);
+      }
+      await clearLog();
+      const before = new Set((await mdmList()).map((d) => d.id));
+      await s.mouse(top.x, top.y, "click");
+      const item = await until("#feed1's file, in MDM's list", 15000, async () => (await mdmList().catch(() => [])).find((d) => !before.has(d.id))).catch(async (e) => {
+        throw new Error(`${e.message} (the button: ${JSON.stringify(await s.pill(PILL_STATE))}, the menu: ${JSON.stringify(await s.picks())})`);
+      });
+      if (!item.url.startsWith(`${LAB}${FILE_A}?`)) throw new Error(`MDM downloads ${item.url}, not #feed1's file`);
+      const green = await until("the button's green state", 10000, async () => {
+        const q = await s.pill(PILL_STATE);
+        return q && q.state === "sent" ? q : null;
+      });
+      const done = await until(`${item.file}, complete`, 45000, async () => {
+        const d = (await mdmList().catch(() => [])).find((x) => x.id === item.id);
+        if (d && d.status === "Error") throw new Error(`${item.file}: ${d.error}`);
+        return d && d.status === "Complete" ? d : null;
+      });
+      if (fs.statSync(done.path).size !== 2 << 20) throw new Error(`${done.path}: ${fs.statSync(done.path).size} bytes`);
+      // Every request of MDM's for it: the feed as its Referer.
+      const got = await requests(FILE_A);
+      if (!got.length || got.some((e) => e.referer !== `${LAB}/feed`)) throw new Error(`MDM's requests for #feed1's file: ${JSON.stringify(got.map((e) => [brief(e), e.referer]))}`);
+      // The second: the stream's qualities (MDM's look-up of its manifest); 360p picked.
+      const two = await menuOver("#feed2", "720p", "played-stream");
+      const q360 = two.m.rows.find((r) => r.kind === "video" && /\b360p\b/.test(r.name));
+      if (!q360 || !two.m.rows.some((r) => /\b720p\b/.test(r.name))) throw new Error(`#feed2's menu: ${rows(two.m)}`);
+      const before2 = new Set((await mdmList()).map((d) => d.id));
+      await s.mouse(q360.x, q360.y, "click");
+      const stream = await until("#feed2's 360p, in MDM's list", 15000, async () => (await mdmList().catch(() => [])).find((d) => !before2.has(d.id)));
+      if (stream.url !== `${LAB}/hls/master.m3u8`) throw new Error(`MDM downloads ${stream.url}, not #feed2's stream`);
+      const streamed = await until(`${stream.file}, complete`, 90000, async () => {
+        const d = (await mdmList().catch(() => [])).find((x) => x.id === stream.id);
+        if (d && d.status === "Error") throw new Error(`${stream.file}: ${d.error}`);
+        return d && d.status === "Complete" ? d : null;
+      });
+      // The third, the next video: its own file (3 MB), not the first's.
+      const three = await menuOver("#feed3", "360p");
+      if (three.m.rows.length !== 1 || !megabytes(three.m.rows[0].size, 3)) throw new Error(`#feed3's menu: ${rows(three.m)}`);
+      await s.mouse(2, 2);
+      return `#feed1: chip "${one.p.chip}", "${rows(one.m)}", ${done.file} ${done.size} bytes, ${got.length} request(s) with the feed as Referer, "${green.text}"; #feed2: ${rows(two.m)}, 360p: ${streamed.file}; #feed3: "${rows(three.m)}"`;
+    } finally {
+      await stopApp();
+    }
+  },
+
   // #900: a stream on another site's server that serves it only to its page's player: every
   // request, its playlists' and each segment's, must carry that page's Origin and a Referer on it
   // (the lab's /hlsg/, as a site's video server checks; 403 otherwise). The page is the lab's on
@@ -3488,6 +3915,9 @@ const KNOWN_BUGS = {};
 // The registry keys `nmhost --register` and `--unregister` touch (crates/nmhost REGISTRY_KEYS,
 // FIREFOX_KEY, CHROME_EXTERNAL_KEY): each browser's host entry and Chrome's external extension,
 // per user and for everyone (the latter only read: an installed copy's). [key, 32-bit view].
+// Also this account's .torrent and magnet associations (TORRENT_KEYS), which Torrent settings'
+// switch writes (win32.rs set_torrent_handlers): no test instance may touch them (#1058); one
+// changed fails the run, after being put back.
 const HOST = "com.misterdownloadmanager.host";
 const REG_KEYS = ["HKCU", "HKLM"].flatMap((root) => [
   ...[
@@ -3498,7 +3928,8 @@ const REG_KEYS = ["HKCU", "HKLM"].flatMap((root) => [
     "Software\\Mozilla\\NativeMessagingHosts",
   ].map((k) => [`${root}\\${k}\\${HOST}`, false]),
   [`${root}\\Software\\Google\\Chrome\\Extensions`, true],
-]);
+]).concat([".torrent", "magnet", "MisterDownloadManager.Torrent"].map((k) => [`HKCU\\Software\\Classes\\${k}`, false]));
+const TORRENT_KEYS = new Set(REG_KEYS.filter(([k]) => k.includes("\\Classes\\")).map(([k]) => k));
 
 // Linux and macOS: the host's manifests (`<HOST>.json`) in the home folder's browser folders,
 // found by a walk (each browser family has its own places: crates/ipc browsers.rs host_dirs),
@@ -3704,9 +4135,13 @@ async function run() {
         extension_never_ask: true,
         show_start_dialog: false,
         automation_api: true,
-        // The default types plus XZ, for the proxy case (a type other download managers leave alone).
-        auto_types: "3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT R0* R1* RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV XZ Z ZIP",
+        // The default types plus XZ, for the proxy case (a type other download managers leave
+        // alone); TORRENT for the torrents case (#1058).
+        auto_types: "3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT R0* R1* RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF TORRENT WAV WMA WMV XZ Z ZIP",
         category_dirs: dirs,
+        // Torrent settings' switch decided (off): the instance never settles it from this
+        // computer's installer value or associations (#1058).
+        torrent_handler: false,
       },
     }),
   );
@@ -3869,9 +4304,12 @@ async function run() {
         : `${WIN ? "registry" : "host manifests"}: ${regBefore.length} ${WIN ? "keys" : "files"} byte-identical to before the run${regCheck.changed.length ? ` (put back: ${regCheck.changed.join(", ")})` : ""}; present before: ${kept.join(", ") || "none"}`,
     );
   }
+  // A test instance changed this account's .torrent or magnet association (put back above).
+  const associations = regCheck ? regCheck.changed.filter((k) => TORRENT_KEYS.has(k)) : [];
+  if (associations.length) console.log(`registry: the run CHANGED this account's torrent associations (put back): ${associations.join(", ")}`);
   if (test) console.log(testLeft.length ? `test host: STILL REGISTERED: ${testLeft.join(", ")}` : `test host: ${test.keys.join(", ")} registered for the run, removed`);
   console.log(`total ${((Date.now() - t0) / 1000).toFixed(0)}s`);
-  if (results.some((r) => r[2] === "FAILED" || r[2] === "BUG") || (regCheck && regCheck.differ.length) || testLeft.length) process.exit(1);
+  if (results.some((r) => r[2] === "FAILED" || r[2] === "BUG") || (regCheck && regCheck.differ.length) || associations.length || testLeft.length) process.exit(1);
 }
 
 // Run when started, not when another script imports its helpers (tools/readme/browser-shots.mjs).
