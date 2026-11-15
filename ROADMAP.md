@@ -562,6 +562,9 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ macOS: no more **The window stopped responding** report while a file dialog is open: the
+  time its window thread spends in a system Open or Save dialog isn't counted
+  ([#1192](https://github.com/anefzaoui/misterdownloadmanager/issues/1192))
 - ✅ The speed limit shows where the speed does: the progress window's Transfer rate names the
   limit holding the download back (its own, the Speed Limiter's, or the one for all downloads),
   the list's Transfer rate says it in its tip, and the status bar and the tray's tip say while the
