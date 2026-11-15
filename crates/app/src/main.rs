@@ -15,6 +15,7 @@ mod crashui;
 mod debrid;
 mod defaultbrowser;
 mod deferred_rename;
+mod deleter;
 mod derive;
 mod dialogs;
 mod droptarget;
@@ -119,10 +120,9 @@ pub fn app_icon() -> std::sync::Arc<egui::IconData> {
     app_picture()
 }
 
-/// The app icon's picture, the 256 px size, on every system: what MDM draws or hands over as a
-/// picture (the tray's icon, macOS's menu bar item; the crash report window's heading). Not
-/// [`app_icon`], empty on macOS: an empty picture can't be made into the menu bar item, so macOS
-/// had none and closing the window quit (#529).
+/// The app icon's picture, the 256 px size, on every system: what MDM draws as a picture (the
+/// crash report window's heading). Not [`app_icon`], empty on macOS. The tray's icon takes the
+/// hand-made size it is drawn at instead (`tray::picture`, #1161).
 pub fn app_picture() -> std::sync::Arc<egui::IconData> {
     static ICON: std::sync::OnceLock<std::sync::Arc<egui::IconData>> = std::sync::OnceLock::new();
     ICON.get_or_init(|| {
