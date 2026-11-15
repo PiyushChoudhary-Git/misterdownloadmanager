@@ -933,6 +933,7 @@ impl Host {
                 Err(error) => crate::dialogs::tell(
                     crate::i18n::mark("Delete"),
                     crate::i18n::fmt(
+                        // i18n: error dialog when a torrent's files could not be deleted; {file} is the download's name, {error} why
                         crate::i18n::t("{file} could not be deleted from the disk: {error}"),
                         &[("file", &crate::i18n::isolate(&name)), ("error", &error)],
                     ),
@@ -976,30 +977,41 @@ async fn forget_torrent(
                 mdm_torrent::librqbit::torrent_from_bytes(&bytes).map_err(|e| e.to_string())?;
             if !meta.info_hash.as_string().eq_ignore_ascii_case(&spec.hash) {
                 return Err(
+                    // i18n: error when deleting a torrent: the .torrent file MDM kept is another torrent's
                     crate::i18n::t("The saved .torrent file does not match this download")
                         .to_owned(),
                 );
             }
             mdm_torrent::files_from_bytes(&bytes).map_err(|e| e.to_string())?;
-            let owner = spec.ownership.as_ref().ok_or_else(|| {
-                crate::i18n::t(
-                    "The files were kept because this older download has no ownership record",
-                )
-                .to_owned()
-            })?;
-            owner
-                .validate(&bytes, &spec.hash)
-                .map_err(|e| e.to_string())?;
-            owner
-                .delete(
-                    &data,
-                    &spec.folder,
-                    &dest,
-                    spec.files.as_deref(),
-                    !spec.create_subfolder,
-                    &protected,
-                )
-                .map_err(|e| e.to_string())?;
+            match spec.ownership.as_ref() {
+                Some(owner) => {
+                    owner
+                        .validate(&bytes, &spec.hash)
+                        .map_err(|e| e.to_string())?;
+                    owner
+                        .delete(
+                            &data,
+                            &spec.folder,
+                            &dest,
+                            !spec.create_subfolder,
+                            &protected,
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                // Added before ownership records, with the outer folder MDM made for it: its
+                // files go as they always did, except what another download claims.
+                None if spec.create_subfolder && spec.folder == dest => {
+                    crate::torrent_ownership::delete_outer_folder(&bytes, &spec.folder, &protected)
+                        .map_err(|e| e.to_string())?;
+                }
+                None => {
+                    return Err(crate::i18n::t(
+                        // i18n: error when deleting a torrent added by an older MDM that saved no record of its files: they stay on the disk
+                        "The files were kept because this older download has no ownership record",
+                    )
+                    .to_owned());
+                }
+            }
         }
         // Keep the metadata and rename mapping if deletion failed, for recovery.
         if let Some(file) = file {
@@ -1128,6 +1140,7 @@ impl Run {
                         .is_empty()
                         {
                             return Err(crate::i18n::t(
+                                // i18n: error starting a torrent whose files another download in the list now uses
                                 "Another download already claims this torrent's destination",
                             )
                             .to_owned());
@@ -1141,7 +1154,7 @@ impl Run {
                             .validate(&bytes, &spec.hash)
                             .map_err(|e| e.to_string())?;
                         owner
-                            .prepare(&data, &spec.folder, &dest, spec.files.as_deref())
+                            .prepare(&data, &spec.folder, &dest)
                             .map_err(|e| e.to_string())
                     })
                     .await
@@ -1422,6 +1435,27 @@ pub fn magnet_url(hash: &str, name: &str) -> url::Url {
     u
 }
 
+/// The query key that marks a row saved without an outer folder. An older MDM keeps a row's
+/// address as it is but drops the fields it does not know (`create_subfolder`, `ownership`),
+/// so this is what lets this one see, when it reads the row back, that its folder is the
+/// shared Save to folder and not a folder of the torrent's own.
+const DIRECT_MARK: &str = "x.mdm";
+
+/// A magnet link for a torrent saved straight in Save to (see [`DIRECT_MARK`]).
+pub fn direct_magnet_url(hash: &str, name: &str) -> url::Url {
+    let mut u = magnet_url(hash, name);
+    u.query_pairs_mut().append_pair(DIRECT_MARK, "direct");
+    u
+}
+
+/// Whether a row's address says it was saved straight in Save to.
+pub fn url_marks_direct(url: &url::Url) -> bool {
+    url.scheme() == "magnet"
+        && url
+            .query_pairs()
+            .any(|(k, v)| k == DIRECT_MARK && v == "direct")
+}
+
 /// The file the list row stands for: the torrent's folder, or its one file.
 pub fn dest_for(
     meta: &mdm_torrent::Meta,
@@ -1552,6 +1586,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_rows_say_so_in_their_address_where_an_older_build_keeps_it() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let plain = magnet_url(hash, "Set");
+        let direct = direct_magnet_url(hash, "Set");
+        assert!(!url_marks_direct(&plain));
+        assert!(url_marks_direct(&direct));
+        // What an older build saves of a row: the address, but not the fields it does not know.
+        let older: TorrentSpec = serde_json::from_str(&format!(
+            r#"{{"hash":"{hash}","files":null,"folder":"Downloads"}}"#
+        ))
+        .unwrap();
+        assert!(
+            older.create_subfolder,
+            "the default an older row is read with"
+        );
+        assert_eq!(
+            direct.query_pairs().find(|(k, _)| k == "xt").unwrap().1,
+            "urn:btih:".to_owned() + hash,
+            "the link is still the torrent's"
+        );
+    }
+
+    #[test]
     fn direct_layout_survives_restart_and_old_downloads_keep_their_folder() {
         let old: TorrentSpec =
             serde_json::from_str(r#"{"hash":"h","files":null,"folder":"Downloads/Set"}"#).unwrap();
@@ -1622,7 +1679,7 @@ mod tests {
                         .collect(),
                 };
                 owner.initialize(&data, &output, &output, &[]).unwrap();
-                owner.prepare(&data, &output, &output, None).unwrap();
+                owner.prepare(&data, &output, &output).unwrap();
                 std::fs::write(output.join("a.bin"), b"abc").unwrap();
                 std::fs::write(output.join("nested/b.bin"), b"defg").unwrap();
                 if sentinel {

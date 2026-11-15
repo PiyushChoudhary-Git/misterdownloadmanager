@@ -7,7 +7,10 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
 /// Stable identity of the opened object; paths alone do not prove ownership.
-pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 2]> {
+/// Volume, file index and creation time: file indexes are reused (FAT and exFAT derive them
+/// from the directory entry, ReFS does not promise uniqueness), a creation time tells a file
+/// that took the name later from the one recorded. Without all three, no identity.
+pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 3]> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -24,13 +27,22 @@ pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 2]> 
             "the filesystem does not provide a file identity",
         ));
     }
+    let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+        | u64::from(info.ftCreationTime.dwLowDateTime);
+    if created == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the filesystem does not provide a creation time",
+        ));
+    }
     Ok([
         u64::from(info.dwVolumeSerialNumber),
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        created,
     ])
 }
 
-pub fn torrent_file_identity_at(path: &std::path::Path) -> std::io::Result<[u64; 2]> {
+pub fn torrent_file_identity_at(path: &std::path::Path) -> std::io::Result<[u64; 3]> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -45,7 +57,7 @@ pub fn torrent_file_identity_at(path: &std::path::Path) -> std::io::Result<[u64;
 /// Delete the verified object through its handle, even if the path is replaced.
 pub fn remove_owned_torrent_file(
     path: &std::path::Path,
-    expected: [u64; 2],
+    expected: [u64; 3],
 ) -> std::io::Result<bool> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{

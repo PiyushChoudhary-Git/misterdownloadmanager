@@ -436,8 +436,15 @@ fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), String>
 /// Whether Move/Rename can take a download now: a finished file, or nothing of it come in yet.
 fn can_move(i: &Item) -> bool {
     !torrent_shares_folder(i)
+        && !torrent_files_pending(i)
         && i.live.is_none()
         && (i.status == Status::Complete || i.downloaded == 0)
+}
+
+/// A torrent with files of its own that are not all there yet: its engine writes where its
+/// ownership record says, so the row cannot be given another place until it is finished.
+fn torrent_files_pending(item: &Item) -> bool {
+    item.status != Status::Complete && item.torrent.as_ref().is_some_and(|t| t.ownership.is_some())
 }
 
 fn torrent_shares_folder(item: &Item) -> bool {
@@ -668,6 +675,7 @@ fn deferred_rename_disabled_reason_with(
 ) -> Option<&'static str> {
     if torrent_shares_folder(item) {
         return Some(crate::i18n::mark(
+            // i18n: shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
             "This torrent shares its destination folder",
         ));
     }
@@ -4388,11 +4396,20 @@ impl App {
         if torrent_shares_folder(item) {
             self.notice = Some((
                 crate::i18n::mark("Move/Rename"),
+                // i18n: shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
                 crate::i18n::t("This torrent shares its destination folder").to_owned(),
             ));
             return;
         }
         if target == item.dest {
+            return;
+        }
+        if torrent_files_pending(item) {
+            self.notice = Some((
+                crate::i18n::mark("Move/Rename"),
+                // i18n: said when Move is refused: a torrent's files are written where it was added until it is finished
+                crate::i18n::t("A torrent can be moved once it is finished").to_owned(),
+            ));
             return;
         }
         if item.status != Status::Complete {
@@ -5418,7 +5435,14 @@ impl App {
             crate::torrents::dest_for(meta, &add.dir, add.files.as_deref(), add.create_subfolder);
         let ownership = crate::torrent_ownership::Ownership::new(meta);
         if self.torrent_host.busy(&meta.info_hash) {
-            self.notice=Some((crate::i18n::mark("Add torrent"),crate::i18n::t("This torrent is busy. Wait for its current operation to finish before adding it again.").to_owned()));
+            self.notice = Some((
+                crate::i18n::mark("Add torrent"),
+                crate::i18n::t(
+                    // i18n: said when a torrent is added again while an action on the same torrent is still running
+                    "This torrent is busy. Wait for its current operation to finish before adding it again.",
+                )
+                .to_owned(),
+            ));
             return None;
         }
         if self.torrent_account().is_none() {
@@ -5434,6 +5458,7 @@ impl App {
                     crate::i18n::mark("Add torrent"),
                     crate::i18n::fmt(
                         crate::i18n::t(
+                            // i18n: said when a torrent would write a file another download in the list already uses; {file} is its path
                             "Another download already claims {file}. Choose a different destination.",
                         ),
                         &[("file", &crate::i18n::isolate(&path.display().to_string()))],
@@ -5489,8 +5514,13 @@ impl App {
             .filter(|(i, f)| !f.padding && add.files.as_ref().is_none_or(|c| c.contains(i)))
             .map(|(_, f)| f.size)
             .sum();
+        let direct = !add.create_subfolder && meta.files.iter().filter(|f| !f.padding).count() > 1;
         let id = self.push_item(
-            crate::torrents::magnet_url(&meta.info_hash, &meta.name),
+            if direct {
+                crate::torrents::direct_magnet_url(&meta.info_hash, &meta.name)
+            } else {
+                crate::torrents::magnet_url(&meta.info_hash, &meta.name)
+            },
             dest,
             add.category,
             String::new(),
@@ -10007,6 +10037,7 @@ impl App {
         if torrent_shares_folder(item) {
             self.notice = Some((
                 crate::i18n::mark("Move/Rename"),
+                // i18n: shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
                 crate::i18n::t("This torrent shares its destination folder").to_owned(),
             ));
             return;
@@ -12687,6 +12718,7 @@ mod deferred_rename_guard_tests {
                 &crate::rss::Store::default(),
                 &[],
             ),
+            // i18n: shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
             Some("This torrent shares its destination folder")
         );
         let mut owner = item.place_copy();

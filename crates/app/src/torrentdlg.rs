@@ -465,6 +465,7 @@ impl TorrentDialog {
                 if let Some(path) = scan.claimed.first() {
                     self.error = Some(crate::i18n::fmt(
                         crate::i18n::t(
+                            // i18n: said when a torrent would write a file another download in the list already uses; {file} is its path
                             "Another download already claims {file}. Choose a different destination.",
                         ),
                         &[("file", &crate::i18n::isolate(&path.display().to_string()))],
@@ -767,6 +768,7 @@ impl TorrentDialog {
         let create = winui::why_disabled(
             create,
             !allow_subfolder_choice,
+            // i18n: tooltip of the greyed "Create a folder for this torrent" checkbox: debrid downloads cannot use it
             crate::i18n::mark("This option is available for direct BitTorrent downloads"),
         );
         if create.clicked() {

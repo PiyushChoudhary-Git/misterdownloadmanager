@@ -123,6 +123,13 @@ fn load_from(p: &Path, empty: Loaded) -> Loaded {
                 // The page it came from is sent again (#795): the browser's other context
                 // (cookies, User-Agent) is memory only.
                 i.context.referer = i.referer.clone();
+                // A list an older MDM saved dropped the layout of a torrent saved straight in
+                // Save to; its address still says so. Its folder is shared, never its own.
+                if let Some(t) = &mut i.torrent
+                    && crate::torrents::url_marks_direct(&i.url)
+                {
+                    t.create_subfolder = false;
+                }
                 // Downloads that were running when the app closed are now stopped (resumable).
                 if i.status == Status::Downloading {
                     i.status = Status::Stopped;
