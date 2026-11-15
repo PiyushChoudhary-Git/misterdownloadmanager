@@ -585,6 +585,7 @@ These ship in the next version.
   completion happens beside the window (for [#1103](https://github.com/anefzaoui/misterdownloadmanager/issues/1103))
 - ✅ A crash while checking for updates on some computers; a check that goes wrong says why
   ([#1123](https://github.com/anefzaoui/misterdownloadmanager/issues/1123))
+- ✅ A damaged progress file no longer miscounts a download's size
 - ✅ An RSS feed's failed first fetch leaves its backlog a backlog, and an empty search feed still
   gets its episode as news
 - ✅ An excluded site is the same site written with the root's dot (`example.com.`), in the app
