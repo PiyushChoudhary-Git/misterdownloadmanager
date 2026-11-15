@@ -425,6 +425,24 @@ fn torrent_shares_folder(item: &Item) -> bool {
         .is_some_and(|t| t.shares_folder(&item.dest))
 }
 
+fn torrent_claims(
+    items: &[Item],
+    host: &crate::torrents::Host,
+    except: Option<u64>,
+) -> Vec<PathBuf> {
+    let mut paths = host.deletion_claims();
+    for item in items.iter().filter(|i| Some(i.id) != except) {
+        if let Some(spec) = &item.torrent
+            && let Some(owner) = &spec.ownership
+        {
+            paths.extend(owner.paths(&spec.folder, &item.dest));
+        } else if !item.dest.as_os_str().is_empty() {
+            paths.push(item.dest.clone());
+        }
+    }
+    paths
+}
+
 /// What is said when a download can't move, or stays while the others of a selection move.
 fn cant_move_notice() -> (&'static str, String) {
     (
@@ -3527,11 +3545,33 @@ impl App {
 
     /// Take a download off the list (not while it runs); with `files`, its file goes from disk
     /// too: a finished file, or the data so far, including detached torrents.
+    fn claimed_paths(&self, except: Option<u64>) -> Vec<PathBuf> {
+        torrent_claims(&self.items, &self.torrent_host, except)
+    }
+
     fn remove_download(&mut self, id: u64, files: bool) {
+        if self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.torrent.as_ref())
+            .is_some_and(|t| self.torrent_host.busy(&t.hash))
+        {
+            return;
+        }
+        let protected = self.claimed_paths(Some(id));
         if self.item(id).is_some_and(|i| i.live.is_none()) {
             self.release_link(id);
             if let Some(spec) = self.item(id).and_then(|i| i.torrent.clone()) {
-                self.torrent_host.forget(&self.rt, &spec, files);
+                let item = self.items.iter().find(|i| i.id == id).unwrap();
+                self.torrent_host.forget(
+                    &self.rt,
+                    &spec,
+                    &item.dest,
+                    files,
+                    protected,
+                    item.file_name.clone(),
+                );
             } else if files
                 && let Some(i) = self.items.iter().find(|i| i.id == id)
                 // A gallery's folder stays (it may hold other files; #58).
@@ -5245,6 +5285,35 @@ impl App {
     /// download added, if one was (not when the debrid account takes it).
     fn add_torrent(&mut self, add: crate::torrentdlg::TorrentAdd) -> Option<u64> {
         let meta = &add.meta;
+        let folder = meta.folder_in_with_subfolder(&add.dir, add.create_subfolder);
+        let dest =
+            crate::torrents::dest_for(meta, &add.dir, add.files.as_deref(), add.create_subfolder);
+        let ownership = crate::torrent_ownership::Ownership::new(meta);
+        if self.torrent_host.busy(&meta.info_hash) {
+            self.notice=Some((crate::i18n::mark("Add torrent"),crate::i18n::t("This torrent is busy. Wait for its current operation to finish before adding it again.").to_owned()));
+            return None;
+        }
+        if self.torrent_account().is_none() {
+            let claims = self.claimed_paths(None);
+            if let Some(path) = crate::torrent_ownership::conflicts(
+                &ownership.paths(&folder, &dest),
+                &claims,
+                false,
+            )
+            .first()
+            {
+                self.notice = Some((
+                    crate::i18n::mark("Add torrent"),
+                    crate::i18n::fmt(
+                        crate::i18n::t(
+                            "Another download already claims {file}. Choose a different destination.",
+                        ),
+                        &[("file", &crate::i18n::isolate(&path.display().to_string()))],
+                    ),
+                ));
+                return None;
+            }
+        }
         crate::torrent_rename::on_add_torrent(meta);
         if self.torrent_account().is_some()
             && let Some(magnet) =
@@ -5270,9 +5339,6 @@ impl App {
             ));
             return None;
         }
-        let folder = meta.folder_in_with_subfolder(&add.dir, add.create_subfolder);
-        let dest =
-            crate::torrents::dest_for(meta, &add.dir, add.files.as_deref(), add.create_subfolder);
         let preexisting =
             if dest == folder && crate::deferred_rename::folder_has_any_entries(&folder) {
                 let allowed: Vec<PathBuf> = meta
@@ -5316,6 +5382,7 @@ impl App {
                 item.file_name = meta.name.clone();
             }
             item.torrent = Some(crate::torrents::TorrentSpec {
+                ownership: Some(ownership),
                 hash: meta.info_hash.clone(),
                 files: add.files.clone(),
                 folder,
@@ -5328,6 +5395,12 @@ impl App {
                 in_order: add.in_order,
                 ends_first: true,
             });
+        }
+        if let Some(item) = self.items.iter().find(|i| i.id == id)
+            && let Some(spec) = &item.torrent
+        {
+            self.torrent_host
+                .initialize_ownership(&self.rt, spec, &item.dest, add.existing);
         }
         self.selection.set(id);
         if add.start_now {
@@ -5367,6 +5440,7 @@ impl App {
         let known = self.session_hashes();
         let limit = self.settings.speed_limit();
         let (host, rt) = (self.torrent_host.clone(), self.rt.clone());
+        let protected = self.claimed_paths(Some(id));
         let Some(item) = self.item(id) else { return };
         // An explicit Start on a completed download means seed it, even when automatic
         // keep sharing is off. It remains in the session until Stop or a sharing limit.
@@ -5376,11 +5450,10 @@ impl App {
                 .is_some_and(|size| size > 0 && item.downloaded >= size);
         // Its own remembered limit first, as a file download's (#39).
         let limit = item.own_limit.or(limit);
-        let Some(spec) = item.torrent.clone() else {
+        if item.torrent.is_none() {
             return;
-        };
-        let run =
-            crate::torrents::Run::start(&host, &rt, &spec, item.url.clone(), known, limit, share);
+        }
+        let run = crate::torrents::Run::start(&host, &rt, item, known, limit, share, protected);
         item.note(if item.downloaded > 0 {
             // i18n: event log entry, past tense: the download resumed (just now)
             crate::i18n::t("Resumed")
@@ -5605,6 +5678,7 @@ impl App {
         let hash = meta.info_hash.clone();
         let from_magnet = false;
         self.add_torrent(crate::torrentdlg::TorrentAdd {
+            existing: Vec::new(),
             meta,
             dir,
             files: None,
@@ -6193,6 +6267,7 @@ impl App {
                 continue;
             }
             let id = self.add_torrent(crate::torrentdlg::TorrentAdd {
+                existing: Vec::new(),
                 meta,
                 dir,
                 files: None,
@@ -6228,6 +6303,12 @@ impl App {
         }
         let mut answer = ipc::api::ActAnswer::default();
         for &id in ids {
+            let busy = self
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.torrent.as_ref())
+                .is_some_and(|t| self.torrent_host.busy(&t.hash));
             let Some(item) = self.item(id) else {
                 answer.skipped.push(ipc::api::Skipped {
                     id,
@@ -6239,6 +6320,7 @@ impl App {
             // As Resume: a finished gallery may start again (#58).
             let startable = running || item.can_start();
             let why = match action {
+                "start" | "remove" | "delete" if busy => Some("busy"),
                 "pause" if !running => Some("not running"),
                 "pause" => {
                     self.stop_by_hand(id);
@@ -10523,8 +10605,11 @@ impl App {
             }
         }
         let local_torrent = self.torrent_account().is_none();
+        let (items, host) = (&self.items, &self.torrent_host);
         if let Some(t) = &mut self.torrent_dlg {
-            let closed = match t.show(ctx, &self.rt, local_torrent) {
+            let closed = match t.show(ctx, &self.rt, local_torrent, || {
+                torrent_claims(items, host, None)
+            }) {
                 Outcome::Open => false,
                 Outcome::Closed => true,
                 Outcome::Done(add) => {
@@ -12266,6 +12351,7 @@ mod deferred_rename_guard_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut item = test_item(1, dir.path().to_owned());
         item.torrent = Some(crate::torrents::TorrentSpec {
+            ownership: None,
             hash: "0".repeat(40),
             files: None,
             folder: dir.path().to_owned(),
@@ -12321,6 +12407,7 @@ mod deferred_rename_guard_tests {
 
         let mut single_torrent = test_item(3, downloads.join("ubuntu.iso"));
         single_torrent.torrent = Some(crate::torrents::TorrentSpec {
+            ownership: None,
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             folder: downloads.clone(),
             create_subfolder: true,
@@ -12338,6 +12425,7 @@ mod deferred_rename_guard_tests {
         std::fs::create_dir_all(&pack_dir).unwrap();
         let mut folder_torrent = test_item(4, pack_dir.clone());
         folder_torrent.torrent = Some(crate::torrents::TorrentSpec {
+            ownership: None,
             hash: "fedcba9876543210fedcba9876543210fedcba98".into(),
             folder: pack_dir,
             create_subfolder: true,

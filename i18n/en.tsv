@@ -184,6 +184,8 @@
 #. text in the Options window
 #. Options → Accounts: what these accounts are, and the services' rule against sharing
 	A debrid service downloads a file host's link with your own paid account and gives MDM a direct link. Use only your own account: sharing an account or its links breaks the services' terms and can get it suspended. Downloads the browser already started stay as they are.	A debrid service downloads a file host's link with your own paid account and gives MDM a direct link. Use only your own account: sharing an account or its links breaks the services' terms and can get it suspended. Downloads the browser already started stay as they are.
+#. text in torrent_ownership.rs
+	A file appeared or was replaced after this torrent was added. Add the torrent again to confirm using it.	A file appeared or was replaced after this torrent was added. Add the torrent again to confirm using it.
 #. text in a download's progress window
 #. reason shown on the Rename box when the entered name ends with a period
 	A file name cannot end with a dot	A file name cannot end with a dot
@@ -216,6 +218,8 @@
 #. message or event log entry in the main window
 #. tooltip on the disabled Rename box for a single-file torrent
 	A single-file torrent keeps its name	A single-file torrent keeps its name
+#. text in torrent_ownership.rs
+	A torrent file's folder points outside its destination	A torrent file's folder points outside its destination
 #. text in the Add torrent window
 #. Add trackers: MDM never contacts a tracker on this computer or the local network
 	A tracker on this computer or the local network is never contacted: {line}	A tracker on this computer or the local network is never contacted: {line}
@@ -425,6 +429,10 @@
 #. Options → Connection → DNS: a DNS server the user types in
 #. the trailing ... means it is still going on: keep it
 	Another DNS...	Another DNS...
+#. text in torrent downloads
+	Another download already claims this torrent's destination	Another download already claims this torrent's destination
+#. message or event log entry in the main window; text in the Add torrent window
+	Another download already claims {file}. Choose a different destination.	Another download already claims {file}. Choose a different destination.
 #. text in unix.rs
 #. the Scheduler, under "Wake the computer to run this queue" (Linux): the computer's one wake alarm is already set by something else
 	Another program has set the computer's wake alarm	Another program has set the computer's wake alarm
@@ -926,7 +934,7 @@
 	Default download settings	Default download settings
 #. text in the Options window
 	Default max. conn. number	Default max. conn. number
-#. message or event log entry in the main window; button in a dialog box; button in the Options window; button in rssdlg.rs
+#. message or event log entry in the main window; button in a dialog box; button in the Options window; button in rssdlg.rs; text in torrent downloads
 #. button: deletes the category
 #. verb: delete the item
 	Delete	Delete
@@ -3511,6 +3519,8 @@
 #. message or event log entry in the main window
 #. {error} = an error message (keep the braces as they are)
 	The files could not be chosen: {error}	The files could not be chosen: {error}
+#. text in torrent downloads
+	The files were kept because this older download has no ownership record	The files were kept because this older download has no ownership record
 #. text in a dialog box
 #. {error} = an error message (keep the braces as they are)
 	The folder could not be created: {error}	The folder could not be created: {error}
@@ -3536,6 +3546,8 @@
 #. text in errors.rs; text in torrent downloads
 #. an error: the network adapter chosen in Options (a VPN's, usually) is off or gone; {adapter} its name
 	the network adapter {adapter} is not connected	the network adapter {adapter} is not connected
+#. text in torrent_ownership.rs
+	The output folder is invalid	The output folder is invalid
 #. text in extracting archives (a download's log, the Archive password window)
 #. why an archive wasn't extracted (after "Couldn't extract {name}: ")
 	the password is wrong	the password is wrong
@@ -3557,6 +3569,8 @@
 	The report is on your clipboard.	The report is on your clipboard.
 #. text in crashui.rs
 	The report is on your clipboard: paste it in a comment on the issue.	The report is on your clipboard: paste it in a comment on the issue.
+#. text in torrent downloads
+	The saved .torrent file does not match this download	The saved .torrent file does not match this download
 #. text in errors.rs
 #. an FTPS (or other TLS) connection could not be secured
 	the secure connection failed	the secure connection failed
@@ -3642,6 +3656,14 @@
 #. text in torrent downloads
 #. an error: the torrent is gone from the torrent session
 	the torrent is no longer there	the torrent is no longer there
+#. text in torrent_ownership.rs
+	The torrent ownership record belongs to another download	The torrent ownership record belongs to another download
+#. text in torrent_ownership.rs
+	The torrent ownership record contains an unsafe path	The torrent ownership record contains an unsafe path
+#. text in torrent_ownership.rs
+	The torrent ownership record does not match its file list	The torrent ownership record does not match its file list
+#. text in torrent_ownership.rs
+	The torrent ownership record is invalid	The torrent ownership record is invalid
 #. message or event log entry in the main window
 #. {error} = an error message (keep the braces as they are)
 	The trackers could not be added: {error}	The trackers could not be added: {error}
@@ -3770,6 +3792,8 @@
 	this torrent has a file name that isn't safe to write, so it wasn't added: {name}	this torrent has a file name that isn't safe to write, so it wasn't added: {name}
 #. text in the Add torrent window
 	This torrent is already in the download list	This torrent is already in the download list
+#. message or event log entry in the main window
+	This torrent is busy. Wait for its current operation to finish before adding it again.	This torrent is busy. Wait for its current operation to finish before adding it again.
 #. text in errors.rs
 	this torrent is not in the list	this torrent is not in the list
 #. message or event log entry in the main window; text in a download's Properties window
@@ -4354,7 +4378,7 @@
 #. text in a download's Properties window
 #. a kind of file, by its extension: {ext} = "ZIP", "PDF"…
 	{ext} File	{ext} File
-#. message or event log entry in the main window
+#. message or event log entry in the main window; text in torrent downloads
 #. {error} = an error message (keep the braces as they are)
 	{file} could not be deleted from the disk: {error}	{file} could not be deleted from the disk: {error}
 #. text in a dialog box

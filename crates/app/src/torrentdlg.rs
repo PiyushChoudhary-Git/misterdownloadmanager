@@ -31,6 +31,8 @@ crate::theme::themed! {
 
 /// What Download Now / Later adds.
 pub struct TorrentAdd {
+    /// Paths present when the existing-file question was answered.
+    pub existing: Vec<PathBuf>,
     pub meta: Meta,
     /// The selected parent folder; `create_subfolder` chooses the outer layout.
     pub dir: PathBuf,
@@ -83,6 +85,7 @@ pub struct TorrentDialog {
     asking: crate::dialogs::FolderGate<()>,
     /// Asking whether to use files of the torrent's names already in the folder (#40).
     asking_files: crate::dialogs::FilesGate<()>,
+    scanned: Arc<Mutex<DestinationScan>>,
     /// A .torrent on the web (#39, Add URL or the browser): the request it is fetched with
     /// (the browser's cookies). One typed in the box goes as MDM's own downloads do.
     remote: Option<crate::torrents::Remote>,
@@ -90,6 +93,12 @@ pub struct TorrentDialog {
     rename: crate::torrent_rename::TorrentRenamePlugin,
     /// The clipboard's magnet link, read off the window's thread (#661).
     clip: crate::clipboard::Prefill,
+}
+
+#[derive(Default)]
+struct DestinationScan {
+    existing: Vec<PathBuf>,
+    claimed: Vec<PathBuf>,
 }
 
 /// The category of a torrent: its largest file's.
@@ -256,6 +265,7 @@ impl TorrentDialog {
             in_order: false,
             asking: Default::default(),
             asking_files: Default::default(),
+            scanned: Default::default(),
             remote,
             rename: Default::default(),
             clip,
@@ -363,6 +373,7 @@ impl TorrentDialog {
         ctx: &egui::Context,
         rt: &tokio::runtime::Handle,
         allow_subfolder_choice: bool,
+        claims: impl FnOnce() -> Vec<PathBuf>,
     ) -> Outcome<TorrentAdd> {
         // Debrid downloads have a separate HTTP file layout. Keep their existing
         // behavior explicit rather than offering an option they cannot honor.
@@ -424,17 +435,45 @@ impl TorrentDialog {
         );
         let out =
             crate::dialogs::ensure_files_free(ctx, &mut self.asking_files, out, &output, || {
-                let (meta, there) = (meta.clone(), folder.clone());
+                let (meta, there, claims, scanned) =
+                    (meta.clone(), folder.clone(), claims(), self.scanned.clone());
                 move || {
-                    meta.map_or_else(Vec::new, |m| {
-                        m.existing_in_with_subfolder(&there, create_subfolder)
-                    })
+                    let Some(m) = meta else { return Vec::new() };
+                    let existing = m.existing_in_with_subfolder(&there, create_subfolder);
+                    let owner = crate::torrent_ownership::Ownership::new(&m);
+                    let root = m.folder_in_with_subfolder(&there, create_subfolder);
+                    let dest = crate::torrents::dest_for(&m, &there, None, create_subfolder);
+                    let claimed = crate::torrent_ownership::conflicts(
+                        &owner.paths(&root, &dest),
+                        &claims,
+                        true,
+                    );
+                    let found = if claimed.is_empty() {
+                        existing.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    *scanned.lock().unwrap() = DestinationScan { existing, claimed };
+                    found
                 }
             });
         match out {
             Outcome::Open => Outcome::Open,
             Outcome::Closed => Outcome::Closed,
             Outcome::Done(()) => {
+                let scan = self.scanned.lock().unwrap();
+                if let Some(path) = scan.claimed.first() {
+                    self.error = Some(crate::i18n::fmt(
+                        crate::i18n::t(
+                            "Another download already claims {file}. Choose a different destination.",
+                        ),
+                        &[("file", &crate::i18n::isolate(&path.display().to_string()))],
+                    ));
+                    ctx.request_repaint();
+                    return Outcome::Open;
+                }
+                let existing = scan.existing.clone();
+                drop(scan);
                 let Some(meta) = self.meta.take() else {
                     return Outcome::Closed;
                 };
@@ -452,6 +491,7 @@ impl TorrentDialog {
                         .collect()
                 });
                 Outcome::Done(TorrentAdd {
+                    existing,
                     category: category_of(&meta),
                     meta,
                     dir: crate::dialogs::resolve_path(&self.folder),
@@ -472,6 +512,7 @@ impl TorrentDialog {
         // again and inspect the new paths, including unselected overlapping files.
         self.asking = Default::default();
         self.asking_files = Default::default();
+        self.scanned = Default::default();
         self.rows = Default::default();
         if let Some(meta) = &self.meta {
             self.tree = build_tree(meta, self.create_subfolder);

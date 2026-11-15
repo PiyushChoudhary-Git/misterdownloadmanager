@@ -322,14 +322,6 @@ pub fn on_add_torrent_in(session_dir: &Path, meta: &Meta) {
     }
 }
 
-/// Clean up rename mapping when a torrent is removed from the list.
-pub fn on_forget_torrent(hash: &str) {
-    ensure_loaded();
-    if let Some(dir) = session_dir() {
-        mdm_torrent::rename_plugin::remove_renamed_file(&dir, hash);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

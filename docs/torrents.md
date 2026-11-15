@@ -14,6 +14,12 @@ MDM downloads BitTorrent files from magnet links and `.torrent` files. Torrents 
 6. To watch a video while it downloads, tick **Download in order** (see [Download in order](#download-in-order)).
 7. Click **Download Now**, or **Later** to add it to the list without starting.
 
+A destination already claimed by another download, including one waiting with **Later**, must be changed before the torrent can be added. This includes unselected paths because an overlapping piece can write into them. An older torrent without a saved file claim list conservatively reserves its whole destination; choose another destination or remove that list entry without deleting its files before sharing the directory.
+
+**Also delete the file from disk** removes selected files only when MDM has a saved receipt for the file it created. Files present when the torrent was added, unselected files (including partial data from overlapping pieces), replacement files and paths another download claims are kept. Only empty directories created by this torrent are removed; existing directories and a shared **Save to** folder stay. If an older download has no ownership record, MDM keeps its files and explains why. If a file appears or is replaced later, MDM protects it from automatic deletion without blocking resume or sharing. This includes unticked storage files created by the engine and files replaced by an editor save; ticking another file later still works. Unselected storage files can remain empty or partially filled after deletion because their ownership is unproven. For older entries, including ordinary outer-folder and single-file torrents, check the files and remove them manually if needed.
+
+Do not open this download list with a build that predates the folder option. Such a build cannot distinguish a shared destination from a torrent-owned folder.
+
 <!-- steps -->
 
 1. ![Add torrent with a torrent's files as a folder tree, the folder they go to, and Download Now](images/help/torrent-add.webp)

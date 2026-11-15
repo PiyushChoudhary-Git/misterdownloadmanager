@@ -6,7 +6,7 @@
 //! The download list is the truth: on start, torrents the session restored but the list no
 //! longer has are forgotten (their files stay), and the rest wait paused until started.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +29,9 @@ pub struct TorrentSpec {
     /// `folder` is already resolved and is used directly when resuming, either way.
     #[serde(default = "subfolder_by_default")]
     pub create_subfolder: bool,
+    /// Authority to delete objects created by this download. Missing on older rows.
+    #[serde(default)]
+    pub ownership: Option<crate::torrent_ownership::Ownership>,
     /// Bytes sent to peers, in all its runs (librqbit counts only the current one: from 0
     /// again at each resume and each start of the app). Kept by [`Accountant`].
     #[serde(default)]
@@ -408,6 +411,20 @@ pub struct Host {
     busy: Arc<Mutex<HashSet<String>>>,
     /// What each finished action says, by info hash, for its event log (`take_outcomes`).
     outcomes: Arc<Mutex<Vec<Outcome>>>,
+    deleting: Arc<Mutex<HashMap<String, Vec<PathBuf>>>>,
+    initializing: Arc<Mutex<HashMap<String, OwnershipReady>>>,
+}
+
+type OwnershipReady = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+struct DeleteRequest {
+    spec: TorrentSpec,
+    dest: PathBuf,
+    files: bool,
+    protected: Vec<PathBuf>,
+    name: String,
+    file: Option<PathBuf>,
+    data: Option<PathBuf>,
 }
 
 /// A torrent action (#39): the list's right-click menu (Torrent), or the Files tab.
@@ -453,6 +470,8 @@ impl Host {
             upload: Arc::new(Mutex::new(None)),
             busy: Arc::new(Mutex::new(HashSet::new())),
             outcomes: Arc::new(Mutex::new(Vec::new())),
+            deleting: Arc::new(Mutex::new(HashMap::new())),
+            initializing: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -555,7 +574,61 @@ impl Host {
 
     /// Whether an action is busy with this torrent.
     pub fn busy(&self, hash: &str) -> bool {
-        self.busy.lock().unwrap().contains(hash)
+        self.busy.lock().unwrap().contains(hash) || self.deleting.lock().unwrap().contains_key(hash)
+    }
+
+    pub fn deletion_claims(&self) -> Vec<PathBuf> {
+        self.deleting
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    pub fn initialize_ownership(
+        &self,
+        rt: &tokio::runtime::Handle,
+        spec: &TorrentSpec,
+        dest: &Path,
+        existing: Vec<PathBuf>,
+    ) {
+        let Some(owner) = spec.ownership.clone() else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        self.initializing
+            .lock()
+            .unwrap()
+            .insert(owner.token.clone(), rx);
+        let (folder, dest) = (spec.folder.clone(), dest.to_owned());
+        rt.spawn_blocking(move || {
+            let result = state_dir()
+                .ok_or_else(|| crate::i18n::t("no data folder").to_owned())
+                .and_then(|data| {
+                    owner
+                        .initialize(&data, &folder, &dest, &existing)
+                        .map_err(|e| e.to_string())
+                });
+            tx.send_replace(Some(result));
+        });
+    }
+
+    async fn ownership_ready(
+        &self,
+        owner: &crate::torrent_ownership::Ownership,
+    ) -> Result<(), String> {
+        let receiver = self.initializing.lock().unwrap().get(&owner.token).cloned();
+        if let Some(mut receiver) = receiver {
+            loop {
+                if let Some(result) = receiver.borrow().clone() {
+                    return result;
+                }
+                receiver.changed().await.map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// Rename a finished torrent's file or folder on disk through the host's busy guard.
@@ -797,15 +870,79 @@ impl Host {
 
     /// Forget a torrent, using the saved metadata if completion or an idle session
     /// already released its engine handle. Deletion never needs to start the network.
-    pub fn forget(&self, rt: &tokio::runtime::Handle, spec: &TorrentSpec, files: bool) {
+    pub fn forget(
+        &self,
+        rt: &tokio::runtime::Handle,
+        spec: &TorrentSpec,
+        dest: &Path,
+        files: bool,
+        protected: Vec<PathBuf>,
+        name: String,
+    ) {
         crate::torrent_rename::ensure_loaded();
-        let (host, spec, file) = (self.clone(), spec.clone(), torrent_file(&spec.hash));
+        self.start_delete(
+            rt,
+            DeleteRequest {
+                spec: spec.clone(),
+                dest: dest.to_owned(),
+                files,
+                protected,
+                name,
+                file: torrent_file(&spec.hash),
+                data: state_dir(),
+            },
+        );
+    }
+
+    fn start_delete(&self, rt: &tokio::runtime::Handle, request: DeleteRequest) {
+        let DeleteRequest {
+            spec,
+            dest,
+            files,
+            protected,
+            name,
+            file,
+            data,
+        } = request;
+        let claims = spec
+            .ownership
+            .as_ref()
+            .map_or_else(|| vec![dest.to_owned()], |o| o.paths(&spec.folder, &dest));
+        self.deleting
+            .lock()
+            .unwrap()
+            .insert(spec.hash.clone(), claims);
+        let host = self.clone();
+        let rename_dir = data.as_ref().map(|p| p.join("session"));
         rt.spawn(async move {
-            let session = host.cell.lock().await.clone();
-            match forget_torrent(session, file, spec.clone(), files).await {
-                Ok(()) => crate::torrent_rename::on_forget_torrent(&spec.hash),
-                Err(error) => tracing::warn!("torrent files could not be removed: {error}"),
+            let result = async {
+                if let Some(owner) = &spec.ownership {
+                    host.ownership_ready(owner).await?;
+                }
+                let session = host.cell.lock().await.clone();
+                let data = data.ok_or_else(|| crate::i18n::t("no data folder").to_owned())?;
+                forget_torrent(session, file, spec.clone(), dest, files, protected, data).await
             }
+            .await;
+            match result {
+                Ok(()) => {
+                    if let Some(dir) = rename_dir {
+                        mdm_torrent::rename_plugin::remove_renamed_file(&dir, &spec.hash);
+                    }
+                }
+                Err(error) => crate::dialogs::tell(
+                    crate::i18n::mark("Delete"),
+                    crate::i18n::fmt(
+                        crate::i18n::t("{file} could not be deleted from the disk: {error}"),
+                        &[("file", &crate::i18n::isolate(&name)), ("error", &error)],
+                    ),
+                ),
+            }
+            if let Some(owner) = &spec.ownership {
+                host.initializing.lock().unwrap().remove(&owner.token);
+            }
+            // Keep both the hash and its paths reserved until every old side effect is done.
+            host.deleting.lock().unwrap().remove(&spec.hash);
         });
     }
 }
@@ -814,7 +951,10 @@ async fn forget_torrent(
     session: Option<Arc<Torrents>>,
     file: Option<PathBuf>,
     spec: TorrentSpec,
+    dest: PathBuf,
     files: bool,
+    protected: Vec<PathBuf>,
+    data: PathBuf,
 ) -> Result<(), String> {
     if let Some(t) = session
         && t.has(&spec.hash)
@@ -828,15 +968,38 @@ async fn forget_torrent(
     }
     tokio::task::spawn_blocking(move || {
         if files {
-            let file = file.as_ref().ok_or("no saved torrent metadata")?;
+            let file = file.as_ref().ok_or_else(|| {
+                crate::i18n::t("the .torrent file kept for it is gone").to_owned()
+            })?;
             let bytes = mdm_torrent::read_file(file).map_err(|e| e.to_string())?;
-            mdm_torrent::remove_files_from_bytes(
-                &bytes,
-                &spec.hash,
-                &spec.folder,
-                !spec.create_subfolder,
-            )
-            .map_err(|e| e.to_string())?;
+            let meta =
+                mdm_torrent::librqbit::torrent_from_bytes(&bytes).map_err(|e| e.to_string())?;
+            if !meta.info_hash.as_string().eq_ignore_ascii_case(&spec.hash) {
+                return Err(
+                    crate::i18n::t("The saved .torrent file does not match this download")
+                        .to_owned(),
+                );
+            }
+            mdm_torrent::files_from_bytes(&bytes).map_err(|e| e.to_string())?;
+            let owner = spec.ownership.as_ref().ok_or_else(|| {
+                crate::i18n::t(
+                    "The files were kept because this older download has no ownership record",
+                )
+                .to_owned()
+            })?;
+            owner
+                .validate(&bytes, &spec.hash)
+                .map_err(|e| e.to_string())?;
+            owner
+                .delete(
+                    &data,
+                    &spec.folder,
+                    &dest,
+                    spec.files.as_deref(),
+                    !spec.create_subfolder,
+                    &protected,
+                )
+                .map_err(|e| e.to_string())?;
         }
         // Keep the metadata and rename mapping if deletion failed, for recovery.
         if let Some(file) = file {
@@ -844,6 +1007,9 @@ async fn forget_torrent(
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
                 _ => {}
             }
+        }
+        if let Some(owner) = &spec.ownership {
+            owner.forget(&data).map_err(|e| e.to_string())?;
         }
         Ok(())
     })
@@ -934,12 +1100,14 @@ impl Run {
     pub fn start(
         host: &Host,
         rt: &tokio::runtime::Handle,
-        spec: &TorrentSpec,
-        url: url::Url,
+        item: &crate::model::Item,
         known: HashSet<String>,
         limit: Option<u64>,
         keep_sharing: bool,
+        protected: Vec<PathBuf>,
     ) -> Run {
+        let spec = item.torrent.as_ref().expect("torrent run has a spec");
+        let (dest, url) = (item.dest.clone(), item.url.clone());
         let state = Arc::new(Mutex::new(RunState::Starting));
         let own = Arc::new(Mutex::new((limit, spec.upload_limit)));
         let order = Arc::new(Mutex::new(spec.order()));
@@ -948,6 +1116,37 @@ impl Run {
         let order2 = order.clone();
         rt.spawn(async move {
             let res = async {
+                if let Some(owner) = &spec2.ownership {
+                    host.ownership_ready(owner).await?;
+                    let (owner, spec, dest) = (owner.clone(), spec2.clone(), dest);
+                    tokio::task::spawn_blocking(move || {
+                        if !crate::torrent_ownership::conflicts(
+                            &owner.paths(&spec.folder, &dest),
+                            &protected,
+                            true,
+                        )
+                        .is_empty()
+                        {
+                            return Err(crate::i18n::t(
+                                "Another download already claims this torrent's destination",
+                            )
+                            .to_owned());
+                        }
+                        let data = state_dir()
+                            .ok_or_else(|| crate::i18n::t("no data folder").to_owned())?;
+                        let path = torrent_file(&spec.hash)
+                            .ok_or_else(|| crate::i18n::t("no data folder").to_owned())?;
+                        let bytes = mdm_torrent::read_file(&path).map_err(|e| e.to_string())?;
+                        owner
+                            .validate(&bytes, &spec.hash)
+                            .map_err(|e| e.to_string())?;
+                        owner
+                            .prepare(&data, &spec.folder, &dest, spec.files.as_deref())
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                }
                 let t = host.session(known).await?;
                 if t.has(&spec2.hash) {
                     // Its order before it asks any peer for a piece.
@@ -1250,6 +1449,7 @@ mod tests {
 
     fn a_spec() -> TorrentSpec {
         TorrentSpec {
+            ownership: None,
             hash: "h".into(),
             files: None,
             folder: "f".into(),
@@ -1262,6 +1462,93 @@ mod tests {
             in_order: false,
             ends_first: true,
         }
+    }
+
+    #[tokio::test]
+    async fn direct_delete_reserves_hash_and_paths_until_old_metadata_cleanup_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Host::new();
+        let mut spec = a_spec();
+        spec.folder = tmp.path().join("output");
+        spec.ownership = Some(crate::torrent_ownership::Ownership {
+            token: mdm_ipc::random_token(),
+            files: vec![crate::torrent_ownership::Claim {
+                index: 0,
+                path: "README.txt".into(),
+            }],
+        });
+        let (ready, receiver) = tokio::sync::watch::channel(None);
+        host.initializing
+            .lock()
+            .unwrap()
+            .insert(spec.ownership.as_ref().unwrap().token.clone(), receiver);
+        let file = tmp.path().join("same-hash.torrent");
+        std::fs::write(&file, b"old metadata").unwrap();
+        let dest = spec.folder.join("README.txt");
+        host.start_delete(
+            &tokio::runtime::Handle::current(),
+            DeleteRequest {
+                spec: spec.clone(),
+                dest: dest.clone(),
+                files: false,
+                protected: Vec::new(),
+                name: "old row".into(),
+                file: Some(file.clone()),
+                data: Some(tmp.path().to_owned()),
+            },
+        );
+        assert!(host.busy(&spec.hash), "a quick re-add must be rejected");
+        assert_eq!(host.deletion_claims(), vec![dest]);
+        tokio::task::yield_now().await;
+        assert!(file.exists(), "old delete is held before touching metadata");
+        ready.send_replace(Some(Ok(())));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while host.busy(&spec.hash) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!file.exists());
+        assert!(host.deletion_claims().is_empty());
+        std::fs::write(&file, b"new add's metadata").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(std::fs::read(file).unwrap(), b"new add's metadata");
+    }
+
+    #[tokio::test]
+    async fn direct_delete_failure_is_shown_and_keeps_metadata_for_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("keep.torrent");
+        std::fs::write(&file, b"keep metadata").unwrap();
+        let host = Host::new();
+        let spec = a_spec();
+        let name = format!("delete-error-{}", mdm_ipc::random_token());
+        host.start_delete(
+            &tokio::runtime::Handle::current(),
+            DeleteRequest {
+                spec: spec.clone(),
+                dest: tmp.path().join("unrelated"),
+                files: true,
+                protected: Vec::new(),
+                name: name.clone(),
+                file: Some(file.clone()),
+                data: None,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while host.busy(&spec.hash) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            crate::dialogs::told()
+                .iter()
+                .any(|(title, text)| *title == "Delete" && text.contains(&name))
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"keep metadata");
     }
 
     #[test]
@@ -1320,7 +1607,22 @@ mod tests {
         for lifecycle in 0..3 {
             for sentinel in [false, true] {
                 let output = tmp.path().join(format!("case-{lifecycle}-{sentinel}"));
-                std::fs::create_dir_all(output.join("nested")).unwrap();
+                std::fs::create_dir_all(&output).unwrap();
+                let data = tmp.path().join("ownership-state");
+                let owner = crate::torrent_ownership::Ownership {
+                    token: mdm_ipc::random_token(),
+                    files: mdm_torrent::files_from_bytes(&bytes)
+                        .unwrap()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, f)| crate::torrent_ownership::Claim {
+                            index,
+                            path: f.path,
+                        })
+                        .collect(),
+                };
+                owner.initialize(&data, &output, &output, &[]).unwrap();
+                owner.prepare(&data, &output, &output, None).unwrap();
                 std::fs::write(output.join("a.bin"), b"abc").unwrap();
                 std::fs::write(output.join("nested/b.bin"), b"defg").unwrap();
                 if sentinel {
@@ -1332,6 +1634,7 @@ mod tests {
                 spec.hash = hash.clone();
                 spec.folder = output.clone();
                 spec.create_subfolder = false;
+                spec.ownership = Some(owner);
                 if lifecycle < 2 {
                     session
                         .add(&bytes, &output, None, Vec::new(), true)
@@ -1342,9 +1645,17 @@ mod tests {
                     }
                 }
                 let live = (lifecycle < 2).then(|| session.clone());
-                forget_torrent(live, Some(file.clone()), spec, true)
-                    .await
-                    .unwrap();
+                forget_torrent(
+                    live,
+                    Some(file.clone()),
+                    spec,
+                    output.clone(),
+                    true,
+                    Vec::new(),
+                    data,
+                )
+                .await
+                .unwrap();
                 assert!(!file.exists());
                 assert!(!output.join("a.bin").exists());
                 assert!(!output.join("nested").exists());
@@ -1463,6 +1774,7 @@ mod tests {
     #[test]
     fn seeding_limits_are_reached() {
         let spec = |uploaded, seeded_secs| TorrentSpec {
+            ownership: None,
             hash: "h".into(),
             files: None,
             folder: "f".into(),

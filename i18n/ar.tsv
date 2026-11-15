@@ -5794,3 +5794,11 @@ unit	{n} MB/sec	{n} ميغابايت/ثانية
 	Press keys...	اضغط المفاتيح...
 	This shortcut is already in use	هذا الاختصار قيد الاستخدام بالفعل
 	Windows and macOS	Windows و macOS
+
+#. Add torrent: outer folder option
+#, machine
+	Create a folder for this torrent	إنشاء مجلد لهذا التورنت
+
+#. Add torrent: outer folder option
+#, machine
+	This option is available for direct BitTorrent downloads	هذا الخيار متاح لتنزيلات BitTorrent المباشرة

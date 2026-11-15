@@ -9,6 +9,25 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok([metadata.dev(), metadata.ino()])
+}
+
+pub fn torrent_file_identity_at(path: &Path) -> std::io::Result<[u64; 2]> {
+    torrent_file_identity(&std::fs::File::open(path)?)
+}
+
+pub fn remove_owned_torrent_file(path: &Path, expected: [u64; 2]) -> std::io::Result<bool> {
+    let file = std::fs::File::open(path)?;
+    if torrent_file_identity(&file)? != expected || torrent_file_identity_at(path)? != expected {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
+}
+
 /// The program to start again later: the AppImage file itself when running from one (its
 /// programs sit in a temporary mount), else this executable.
 pub fn program() -> Option<PathBuf> {

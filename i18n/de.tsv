@@ -7372,3 +7372,11 @@ unit	{n} MB/sec	{n} MB/s
 	Press keys...	Tasten drücken...
 	This shortcut is already in use	Dieses Tastenkürzel wird bereits verwendet
 	Windows and macOS	Windows und macOS
+
+#. Add torrent: outer folder option
+#, machine
+	Create a folder for this torrent	Ordner für diesen Torrent erstellen
+
+#. Add torrent: outer folder option
+#, machine
+	This option is available for direct BitTorrent downloads	Diese Option ist für direkte BitTorrent-Downloads verfügbar

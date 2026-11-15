@@ -562,6 +562,7 @@ mod tests {
     fn a_torrents_properties_close_with_ok() {
         let mut torrent = item("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
         torrent.torrent = Some(crate::torrents::TorrentSpec {
+            ownership: None,
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             files: None,
             folder: PathBuf::from("f"),
