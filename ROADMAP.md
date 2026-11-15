@@ -562,6 +562,10 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ The speed limit shows where the speed does: the progress window's Transfer rate names the
+  limit holding the download back (its own, the Speed Limiter's, or the one for all downloads),
+  the list's Transfer rate says it in its tip, and the status bar and the tray's tip say while the
+  Speed Limiter is on ([#1191](https://github.com/anefzaoui/misterdownloadmanager/issues/1191))
 - ✅ The window opens at once when an unfinished download is on a network share that doesn't
   answer or a sleeping drive: downloads' progress, and a new video's name, are read beside it
   (found with [#1170](https://github.com/anefzaoui/misterdownloadmanager/issues/1170))
