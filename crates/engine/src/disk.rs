@@ -30,10 +30,6 @@ pub struct Volume {
     pub file_system: String,
 }
 
-/// The volume `path` is on, or will be once created: a missing folder is looked up through the
-/// nearest folder above it that exists. Only that volume is asked (a network drive too). None
-/// when no folder of the path exists (a removed drive) or the system can't tell: the check is
-/// then skipped.
 /// Extend a download through its already authorized handle, retaining sparse-file behavior.
 pub fn resize_download_file(file: &std::fs::File, length: u64) -> std::io::Result<()> {
     if length >= crate::sparse::MIN_SIZE {
@@ -42,6 +38,10 @@ pub fn resize_download_file(file: &std::fs::File, length: u64) -> std::io::Resul
     file.set_len(length)
 }
 
+/// The volume `path` is on, or will be once created: a missing folder is looked up through the
+/// nearest folder above it that exists. Only that volume is asked (a network drive too). None
+/// when no folder of the path exists (a removed drive) or the system can't tell: the check is
+/// then skipped.
 pub fn volume_of(path: &Path) -> Option<Volume> {
     let path = if path.as_os_str().is_empty() {
         Path::new(".")
