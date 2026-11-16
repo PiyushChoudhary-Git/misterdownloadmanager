@@ -33,11 +33,13 @@ pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 5]> 
     ])
 }
 
-/// The identity of the plain file at `path`. Anything else there (a pipe, a device, a link)
-/// has none and is not opened: opening a FIFO with nobody writing to it waits for ever, and
-/// the torrent would stay busy until MDM was restarted.
+/// The identity of the plain file or folder at `path` (the folders MDM made for a torrent are
+/// recorded too). Anything else there (a pipe, a device, a link) has none and is not opened:
+/// opening a FIFO with nobody writing to it waits for ever, and the torrent would stay busy
+/// until MDM was restarted.
 pub fn torrent_file_identity_at(path: &Path) -> std::io::Result<[u64; 5]> {
-    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if !kind.is_file() && !kind.is_dir() {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     torrent_file_identity(&std::fs::File::open(path)?)

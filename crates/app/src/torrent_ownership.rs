@@ -1715,4 +1715,19 @@ mod tests {
         std::fs::write(root.join("f7.bin"), b"other").unwrap();
         assert_eq!(own.verified(tmp.path(), &root, &root).unwrap().len(), 999);
     }
+
+    /// A pipe at a claimed path must not be opened (it would wait for a writer for ever, and
+    /// the torrent would stay busy until MDM restarted); a folder MDM made has an identity.
+    #[cfg(unix)]
+    #[test]
+    fn direct_a_pipe_at_a_path_is_not_opened_and_a_folder_has_an_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            assert!(identity_at(&fifo).is_err());
+        }
+        assert!(identity_at(tmp.path()).is_ok());
+        assert!(identity_at(&tmp.path().join("missing")).is_err());
+    }
 }
