@@ -1730,4 +1730,29 @@ mod tests {
         assert!(identity_at(tmp.path()).is_ok());
         assert!(identity_at(&tmp.path().join("missing")).is_err());
     }
+
+    /// Deleting a torrent while a program still has its files open (the engine on its way out,
+    /// an antivirus scanning files just made) must remove them, as it always did: on Windows
+    /// the delete went through a handle that refused to share, and about one file in twenty of
+    /// a big torrent was left behind with "Access is denied".
+    #[test]
+    fn direct_files_another_program_still_has_open_are_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        std::fs::create_dir_all(&root).unwrap();
+        let names: Vec<String> = (0..40).map(|i| format!("d{}/f{i}.bin", i % 4)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let own = owner(&refs);
+        own.initialize(tmp.path(), &root, &root, &[]).unwrap();
+        let held = own.prepare(tmp.path(), &root, &root).unwrap();
+        for f in &held {
+            use std::io::Write;
+            (&f.file).write_all(b"data").unwrap();
+        }
+        let kept = own.delete(tmp.path(), &root, &root, false, &[]).unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
+        drop(held);
+        // Every file and the folders MDM made went; the folder the person made stays, empty.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 }
