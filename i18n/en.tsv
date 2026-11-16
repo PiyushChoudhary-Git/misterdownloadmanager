@@ -10,6 +10,10 @@
 #. Click'n'Load window: a page whose web site the browser doesn't name, so MDM can't tell which site it is
 #. {n} = a number (keep the braces as they are)
 @plural	An unknown site wants to send {n} link to Link grabber.|An unknown site wants to send {n} links to Link grabber.	An unknown site wants to send {n} link to Link grabber.|An unknown site wants to send {n} links to Link grabber.
+#. count in torrent downloads
+#. number of additional files in the torrent reuse confirmation
+#. {n} = a number (keep the braces as they are)
+@plural	And {n} other file.|And {n} other files.	And {n} other file.|And {n} other files.
 #. count in a dialog box
 #. never shown for a single download
 #. {n} = a number (keep the braces as they are)
@@ -220,12 +224,8 @@
 #. message or event log entry in the main window
 #. tooltip on the disabled Rename box for a single-file torrent
 	A single-file torrent keeps its name	A single-file torrent keeps its name
-#. message or event log entry in the main window; text in a download's Properties window
-#. said when Move is refused: a torrent's files are written where it was added until it is finished
-#. shown when Move is refused: an unfinished torrent writes its files where it was added
-	A torrent can be moved once it is finished	A torrent can be moved once it is finished
 #. text in torrent_ownership.rs
-#. error when a folder inside a torrent's destination leads somewhere else (a junction or link)
+#. a torrent's folder is a link or junction leading outside its destination
 	A torrent file's folder points outside its destination	A torrent file's folder points outside its destination
 #. text in the Add torrent window
 #. Add trackers: MDM never contacts a tracker on this computer or the local network
@@ -440,7 +440,7 @@
 #. the trailing ... means it is still going on: keep it
 	Another DNS...	Another DNS...
 #. text in torrent downloads
-#. error starting a torrent whose files another download in the list now uses
+#. starting a torrent whose destination another listed download claims
 	Another download already claims this torrent's destination	Another download already claims this torrent's destination
 #. message or event log entry in the main window; text in the Add torrent window
 #. said when a torrent would write a file another download in the list already uses; {file} is its path
@@ -3504,6 +3504,9 @@
 	the connection to {host} was cut: a firewall, or a network that blocks it	the connection to {host} was cut: a firewall, or a network that blocks it
 #. text in errors.rs
 	the connection was lost while receiving data	the connection was lost while receiving data
+#. text in torrent downloads
+#. files kept appearing while the user was confirming a torrent start; stop rather than repeat questions indefinitely
+	The destination keeps changing. Stop changes to its files and try starting the torrent again.	The destination keeps changing. Stop changes to its files and try starting the torrent again.
 #. text in the Add torrent window
 #. a magnet link's lookup, after 30 seconds: the DHT got no answer from anyone
 	The DHT reached no one. A firewall, a VPN or the network may be blocking UDP, which the DHT and most trackers use.	The DHT reached no one. A firewall, a VPN or the network may be blocking UDP, which the DHT and most trackers use.
@@ -3631,6 +3634,9 @@
 #. text in torrent downloads
 #. error when deleting a torrent: the .torrent file MDM kept is another torrent's
 	The saved .torrent file does not match this download	The saved .torrent file does not match this download
+#. text in torrent downloads
+#. starting an old torrent whose cached metadata was lost; re-adding can restore it without deleting data
+	The saved .torrent file is missing or unreadable. Add the torrent again to recover its metadata; keep its existing files.	The saved .torrent file is missing or unreadable. Add the torrent again to recover its metadata; keep its existing files.
 #. text in errors.rs
 #. an FTPS (or other TLS) connection could not be secured
 	the secure connection failed	the secure connection failed
@@ -3717,6 +3723,7 @@
 #. an error: the torrent is gone from the torrent session
 	the torrent is no longer there	the torrent is no longer there
 #. text in torrent_ownership.rs
+#. unsafe path found in a saved torrent ownership record
 #. error when the saved record of a torrent's files holds a path that leaves its folder
 	The torrent ownership record contains an unsafe path	The torrent ownership record contains an unsafe path
 #. text in torrent_ownership.rs
@@ -3725,6 +3732,9 @@
 #. text in torrent_ownership.rs
 #. error when the saved record of a torrent's files cannot be read as one
 	The torrent ownership record is invalid	The torrent ownership record is invalid
+#. text in torrent downloads
+#. the user refused write permission for existing files when starting a torrent
+	The torrent was not started because permission to use existing files was declined.	The torrent was not started because permission to use existing files was declined.
 #. message or event log entry in the main window
 #. {error} = an error message (keep the braces as they are)
 	The trackers could not be added: {error}	The trackers could not be added: {error}
@@ -3752,6 +3762,9 @@
 #. text in extracting archives (a download's log, the Archive password window)
 #. why an archive wasn't extracted (after "Couldn't extract {name}: "); HatchZip is a program's name
 	there isn't enough free space for its files, HatchZip says; nothing was changed	there isn't enough free space for its files, HatchZip says; nothing was changed
+#. text in torrent downloads
+#. question before starting/resuming a torrent that would modify files without a matching ownership/consent record; Yes authorizes writes, No leaves files unchanged
+	These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?	These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?
 #. text in a download's progress window
 	These settings are unavailable when "Show download complete dialog" is turned on	These settings are unavailable when "Show download complete dialog" is turned on
 #. text in helpers.rs
@@ -3862,6 +3875,9 @@
 	This torrent is busy. Wait for its current operation to finish before adding it again.	This torrent is busy. Wait for its current operation to finish before adding it again.
 #. text in errors.rs
 	this torrent is not in the list	this torrent is not in the list
+#. text in torrent_ownership.rs
+#. torrent start needs explicit write permission; {file} is the first existing file without a matching grant
+	This torrent needs permission to use {file} before it can start.	This torrent needs permission to use {file} before it can start.
 #. message or event log entry in the main window; text in a download's Properties window
 #. shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
 	This torrent shares its destination folder	This torrent shares its destination folder
@@ -4108,6 +4124,8 @@
 	Use authorization	Use authorization
 #. text in the Options window
 	Use automatic configuration script	Use automatic configuration script
+#. text in torrent downloads
+	Use existing torrent files	Use existing torrent files
 #. checkbox in the Options window
 	Use FTP in PASV mode	Use FTP in PASV mode
 #. button in helpers.rs
@@ -4466,9 +4484,6 @@
 	{file} is too large to be a list of addresses ({size}). Import reads text files, web pages and .ef2 exports of up to {limit}.	{file} is too large to be a list of addresses ({size}). Import reads text files, web pages and .ef2 exports of up to {limit}.
 #. text in a dialog box
 	{file} was moved elsewhere by dragging it out of Download complete, and MDM couldn't learn where. Look for it where you dropped it.	{file} was moved elsewhere by dragging it out of Download complete, and MDM couldn't learn where. Look for it where you dropped it.
-#. text in torrent_ownership.rs
-#. error starting a torrent: a file that is not the torrent's is at a path the torrent writes, and would be overwritten; {file} is its path
-	{file} was saved there, or replaced, after this torrent was added, so it was not started: it would be overwritten. Move the file away and start again.	{file} was saved there, or replaced, after this torrent was added, so it was not started: it would be overwritten. Move the file away and start again.
 #. text in the Checksum window
 #. {algorithm} = a checksum algorithm such as "SHA-256" (keep the braces as they are)
 	{file}: the file does NOT match its checksum ({algorithm})	{file}: the file does NOT match its checksum ({algorithm})

@@ -32,7 +32,7 @@ crate::theme::themed! {
 /// What Download Now / Later adds.
 pub struct TorrentAdd {
     /// Paths present when the existing-file question was answered.
-    pub existing: Vec<PathBuf>,
+    pub existing: Vec<crate::torrent_ownership::Consent>,
     pub meta: Meta,
     /// The selected parent folder; `create_subfolder` chooses the outer layout.
     pub dir: PathBuf,
@@ -97,7 +97,7 @@ pub struct TorrentDialog {
 
 #[derive(Default)]
 struct DestinationScan {
-    existing: Vec<PathBuf>,
+    consent: Vec<crate::torrent_ownership::Consent>,
     claimed: Vec<PathBuf>,
 }
 
@@ -453,7 +453,8 @@ impl TorrentDialog {
                     } else {
                         Vec::new()
                     };
-                    *scanned.lock().unwrap() = DestinationScan { existing, claimed };
+                    let consent = crate::torrent_ownership::consent_for(&existing);
+                    *scanned.lock().unwrap() = DestinationScan { consent, claimed };
                     found
                 }
             });
@@ -473,7 +474,7 @@ impl TorrentDialog {
                     ctx.request_repaint();
                     return Outcome::Open;
                 }
-                let existing = scan.existing.clone();
+                let existing = scan.consent.clone();
                 drop(scan);
                 let Some(meta) = self.meta.take() else {
                     return Outcome::Closed;

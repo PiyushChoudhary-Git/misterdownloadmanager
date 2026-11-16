@@ -9,24 +9,35 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Device, inode and birth time: a freed inode is soon given to another file, so the inode alone
-/// can name a file the person saved later. A filesystem that keeps no birth time gives no
-/// identity, and such files are never deleted by MDM.
-pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 3]> {
+/// Inode and birth time: a freed inode is soon given to another file, so the inode alone can
+/// name a file the person saved later. The device is left out on purpose: its number depends on
+/// the order disks were plugged in and changes across a reboot or a replug, which would make
+/// MDM's own files look like strangers. A filesystem that keeps no birth time gives no
+/// identity, and such files are never deleted by MDM; a start asks before writing to them.
+pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 5]> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
     let born = metadata
         .created()?
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?;
-    Ok([metadata.dev(), metadata.ino(), born.as_nanos() as u64])
+    if born.is_zero() {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    Ok([
+        0,
+        metadata.ino(),
+        0,
+        born.as_secs(),
+        u64::from(born.subsec_nanos()),
+    ])
 }
 
-pub fn torrent_file_identity_at(path: &Path) -> std::io::Result<[u64; 3]> {
+pub fn torrent_file_identity_at(path: &Path) -> std::io::Result<[u64; 5]> {
     torrent_file_identity(&std::fs::File::open(path)?)
 }
 
-pub fn remove_owned_torrent_file(path: &Path, expected: [u64; 3]) -> std::io::Result<bool> {
+pub fn remove_owned_torrent_file(path: &Path, expected: [u64; 5]) -> std::io::Result<bool> {
     let file = std::fs::File::open(path)?;
     if torrent_file_identity(&file)? != expected || torrent_file_identity_at(path)? != expected {
         return Ok(false);

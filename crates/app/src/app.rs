@@ -472,15 +472,8 @@ fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), String>
 /// Whether Move/Rename can take a download now: a finished file, or nothing of it come in yet.
 fn can_move(i: &Item) -> bool {
     !torrent_shares_folder(i)
-        && !torrent_files_pending(i)
         && i.live.is_none()
         && (i.status == Status::Complete || i.downloaded == 0)
-}
-
-/// A torrent with files of its own that are not all there yet: its engine writes where its
-/// ownership record says, so the row cannot be given another place until it is finished.
-fn torrent_files_pending(item: &Item) -> bool {
-    item.status != Status::Complete && item.torrent.as_ref().is_some_and(|t| t.ownership.is_some())
 }
 
 fn torrent_shares_folder(item: &Item) -> bool {
@@ -550,10 +543,15 @@ fn take_place(item: &mut Item, target: PathBuf) {
         }
         item.file_name = name;
     }
-    if let Some(spec) = item.torrent.as_mut()
-        && spec.folder == old_dest
-    {
-        spec.folder = target.clone();
+    if let Some(spec) = item.torrent.as_mut() {
+        if spec.folder == old_dest {
+            spec.folder = target.clone();
+        } else if let Some(parent) = target.parent() {
+            spec.folder = parent.to_owned();
+            if target.file_name() != old_dest.file_name() {
+                crate::torrent_rename::on_single_move(&spec.hash, &target);
+            }
+        }
     }
     if let Some(files) = item.written_files.as_mut() {
         for p in files {
@@ -1162,6 +1160,7 @@ pub struct App {
     last_find: Option<crate::find::Query>,
     /// A message with OK: its window title and message: "Cannot find …", an export that failed…
     notice: Option<(&'static str, String)>,
+    file_confirmation: Option<dialogs::Confirmation>,
     /// The list files Import is reading, beside the window (#805).
     importing: crate::transfer::Importing,
     /// Why the last save of the download list failed (told once per reason).
@@ -1847,6 +1846,7 @@ impl App {
             find: None,
             last_find: None,
             notice: None,
+            file_confirmation: None,
             importing: Default::default(),
             save_failed: None,
             moving: Vec::new(),
@@ -4674,16 +4674,36 @@ impl App {
         if target == item.dest {
             return;
         }
-        if torrent_files_pending(item) {
-            self.notice = Some((
-                crate::i18n::mark("Move/Rename"),
-                // i18n: said when Move is refused: a torrent's files are written where it was added until it is finished
-                crate::i18n::t("A torrent can be moved once it is finished").to_owned(),
-            ));
-            return;
+        // A torrent's engine only opens files MDM has checked, at the place it checked: one
+        // that is moved here has its old permission withdrawn, and its next start checks the
+        // new place.
+        let torrent = item.torrent.clone();
+        if let Some(spec) = &torrent {
+            crate::torrents::revoke_grant(&spec.hash);
         }
         if item.status != Status::Complete {
             if item.downloaded == 0 {
+                // Not started, or started and stopped before a byte came: the empty files MDM
+                // made for it at the old place are removed (only those it made), the new place
+                // takes the torrent.
+                if let Some(spec) = torrent.filter(|t| t.ownership.is_some()) {
+                    let (old_dest, old_folder) = (item.dest.clone(), spec.folder.clone());
+                    let protected = self.claimed_paths(Some(id));
+                    std::thread::spawn(move || {
+                        if let (Some(data), Some(owner)) =
+                            (crate::torrents::state_dir(), spec.ownership.as_ref())
+                        {
+                            let _ = owner.delete(
+                                &data,
+                                &old_folder,
+                                &old_dest,
+                                !spec.create_subfolder,
+                                &protected,
+                            );
+                        }
+                    });
+                }
+                let Some(item) = self.item(id) else { return };
                 take_place(item, target);
                 self.dirty = true;
             }
@@ -4694,7 +4714,26 @@ impl App {
         let to = target.clone();
         item.note(crate::i18n::t("Moving the file..."));
         std::thread::spawn(move || {
-            let _ = tx.send(move_file(&from, &to));
+            // The files that are still MDM's own, found before they move: a copy to another
+            // drive gives each another volume and index, and only those are recorded again.
+            let record = torrent.as_ref().and_then(|spec| {
+                let owner = spec.ownership.as_ref()?;
+                let data = crate::torrents::state_dir()?;
+                let ours = owner.verified(&data, &spec.folder, &from).ok()?;
+                Some((owner, data, ours, spec.folder == from))
+            });
+            let moved = move_file(&from, &to);
+            if moved.is_ok()
+                && let Some((owner, data, ours, whole)) = record
+            {
+                let folder = if whole {
+                    to.clone()
+                } else {
+                    to.parent().unwrap_or(&to).to_owned()
+                };
+                let _ = owner.rebind(&data, &ours, &folder, &to);
+            }
+            let _ = tx.send(moved);
         });
         self.moving.push((id, target, rx));
     }
@@ -6166,7 +6205,15 @@ impl App {
         if self.torrent_host.busy(&spec.hash) {
             return;
         }
-        self.torrent_host.act(&self.rt, known, &spec, act);
+        let dest = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.dest.clone())
+            .unwrap_or_default();
+        let protected = self.claimed_paths(Some(id));
+        self.torrent_host
+            .act(&self.rt, known, &spec, dest, protected, act);
     }
 
     /// Files ticked or unticked in a torrent's Files tab (#39): the torrent downloads `files`
@@ -10881,7 +10928,18 @@ impl App {
                 }
             }
         }
-        if let Some((title, text)) = &self.notice
+        if self.file_confirmation.is_none() {
+            self.file_confirmation = dialogs::next_confirmation();
+        }
+        if let Some(question) = &self.file_confirmation {
+            match dialogs::show_confirmation(ctx, question) {
+                Outcome::Open => {}
+                Outcome::Done(yes) => self.file_confirmation.take().unwrap().answer(yes),
+                Outcome::Closed => self.file_confirmation.take().unwrap().answer(false),
+            }
+        }
+        if self.file_confirmation.is_none()
+            && let Some((title, text)) = &self.notice
             && !matches!(dialogs::message(ctx, "notice", title, text), Outcome::Open)
         {
             self.notice = None;

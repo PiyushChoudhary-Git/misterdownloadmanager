@@ -309,6 +309,13 @@ pub fn on_add_torrent(meta: &Meta) {
     on_add_torrent_in(&dir, meta);
 }
 
+/// A queued single-file row follows both its new directory and its chosen filename.
+pub fn on_single_move(hash: &str, target: &Path) {
+    if let (Some(dir), Some(name)) = (session_dir(), target.file_name().and_then(|n| n.to_str())) {
+        mdm_torrent::rename_plugin::set_renamed_file(&dir, hash, name);
+    }
+}
+
 pub fn on_add_torrent_in(session_dir: &Path, meta: &Meta) {
     let non_padding: Vec<&mdm_torrent::FileEntry> =
         meta.files.iter().filter(|f| !f.padding).collect();

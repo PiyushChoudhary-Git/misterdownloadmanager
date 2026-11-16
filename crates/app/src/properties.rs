@@ -252,9 +252,7 @@ impl Properties {
             .torrent
             .as_ref()
             .is_some_and(|t| t.shares_folder(&item.dest));
-        // A torrent's engine writes where its files were set up, until they are all there.
-        let pending = !complete && item.torrent.as_ref().is_some_and(|t| t.ownership.is_some());
-        let movable = !shared && !pending && !running && (complete || item.downloaded == 0);
+        let movable = !shared && !running && (complete || item.downloaded == 0);
         let pick = winui::button_light(
             ui,
             r(o, 393.0, 141.0, 73.0, 21.0),
@@ -273,9 +271,6 @@ impl Properties {
             if shared {
                 // i18n: shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
                 crate::i18n::mark("This torrent shares its destination folder")
-            } else if pending {
-                // i18n: shown when Move is refused: an unfinished torrent writes its files where it was added
-                crate::i18n::mark("A torrent can be moved once it is finished")
             } else if running {
                 // i18n: tooltip of the greyed Move button in File Properties
                 crate::i18n::mark("Pause the download first")
