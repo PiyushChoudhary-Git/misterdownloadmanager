@@ -11,9 +11,8 @@
 #. {n} = a number (keep the braces as they are)
 #, machine
 @plural	An unknown site wants to send {n} link to Link grabber.|An unknown site wants to send {n} links to Link grabber.	يريد موقع غير معروف إرسال {n} رابط إلى ملتقط الروابط.|يريد موقع غير معروف إرسال {n} رابط إلى ملتقط الروابط.|يريد موقع غير معروف إرسال {n} رابطين إلى ملتقط الروابط.|يريد موقع غير معروف إرسال {n} روابط إلى ملتقط الروابط.|يريد موقع غير معروف إرسال {n} رابطا إلى ملتقط الروابط.|يريد موقع غير معروف إرسال {n} رابط إلى ملتقط الروابط.
-
 #. count in torrent downloads
-#. number of additional files in the torrent reuse confirmation
+#. number of additional files in a list of files
 #. {n} = a number (keep the braces as they are)
 #, machine
 @plural	And {n} other file.|And {n} other files.	و{n} ملف آخر|و{n} ملف آخر|و{n} ملفين آخرين|و{n} ملفات أخرى|و{n} ملفا آخر|و{n} ملف آخر
@@ -226,6 +225,10 @@
 #. text in rssdlg.rs
 #. RSS feeds window, Download rules: shown when there are no rules yet
 	A rule adds the new articles whose titles it matches, as they come.	تضيف القاعدة المقالات الجديدة التي تطابق عناوينها، فور ورودها.
+#. text in torrent downloads
+#. question before starting/resuming a torrent that would modify files MDM did not create; Yes authorizes writes, No leaves files unchanged
+#, machine
+	MDM didn't create these files. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use them for this torrent?	لم ينشئ MDM هذه الملفات. قد يؤدي بدء التورنت إلى تغيير حجمها واستبدال محتواها، بما في ذلك الملفات غير المحددة التي تشترك في الأجزاء. هل تريد استخدامها لهذا التورنت؟
 #. text in errors.rs
 #. an error: a server on this computer redirected the download to the internet, which would not go through the chosen network adapter; {adapter} its name
 	a server on this computer sent the download elsewhere, which would not go through {adapter}	أرسل خادم على هذا الكمبيوتر التنزيل إلى مكان آخر، ولن يمر عبر {adapter}
@@ -233,7 +236,6 @@
 #. tooltip on the disabled Rename box for a single-file torrent
 #, machine
 	A single-file torrent keeps its name	يحتفظ التورنت ذو الملف الواحد باسمه
-
 #. text in torrent_ownership.rs
 #. a torrent's folder is a link or junction leading outside its destination
 #, machine
@@ -460,12 +462,10 @@
 #. Options → Connection → DNS: a DNS server the user types in
 #. the trailing ... means it is still going on: keep it
 	Another DNS...	خادم DNS آخر...
-
 #. text in torrent downloads
 #. starting a torrent whose destination another listed download claims
 #, machine
 	Another download already claims this torrent's destination	هناك تنزيل آخر يستخدم بالفعل وجهة هذا التورنت
-
 #. message or event log entry in the main window; text in the Add torrent window
 #. said when a torrent would write a file another download in the list already uses; {file} is its path
 #, machine
@@ -3675,7 +3675,6 @@
 	the connection to {host} was cut: a firewall, or a network that blocks it	انقطع الاتصال بـ{host}: قد يكون السبب جدار حماية أو شبكة تمنع الاتصال
 #. text in errors.rs
 	the connection was lost while receiving data	انقطع الاتصال أثناء استلام البيانات
-
 #. text in torrent downloads
 #. files kept appearing while the user was confirming a torrent start; stop rather than repeat questions indefinitely
 #, machine
@@ -3748,7 +3747,6 @@
 #. message or event log entry in the main window
 #. {error} = an error message (keep the braces as they are)
 	The files could not be chosen: {error}	تعذر اختيار الملفات: {error}
-
 #. text in torrent downloads
 #. error when deleting a torrent added by an older MDM that saved no record of its files: they stay on the disk
 #, machine
@@ -3781,7 +3779,6 @@
 #. text in errors.rs; text in torrent downloads
 #. an error: the network adapter chosen in Options (a VPN's, usually) is off or gone; {adapter} its name
 	the network adapter {adapter} is not connected	محول الشبكة {adapter} غير متصل
-
 #. text in torrent_ownership.rs
 #. error when a torrent's output folder path cannot be used
 #, machine
@@ -3807,12 +3804,10 @@
 	The report is on your clipboard.	التقرير موجود في حافظتك.
 #. text in crashui.rs
 	The report is on your clipboard: paste it in a comment on the issue.	التقرير موجود في حافظتك: الصقه في تعليق على المشكلة.
-
 #. text in torrent downloads
 #. error when deleting a torrent: the .torrent file MDM kept is another torrent's
 #, machine
 	The saved .torrent file does not match this download	ملف .torrent المحفوظ لا يطابق هذا التنزيل
-
 #. text in torrent downloads
 #. starting an old torrent whose cached metadata was lost; re-adding can restore it without deleting data
 #, machine
@@ -3916,23 +3911,19 @@
 #. text in torrent downloads
 #. an error: the torrent is gone from the torrent session
 	the torrent is no longer there	التورنت لم يعد موجودا
-
 #. text in torrent_ownership.rs
 #. unsafe path found in a saved torrent ownership record
 #. error when the saved record of a torrent's files holds a path that leaves its folder
 #, machine
 	The torrent ownership record contains an unsafe path	سجل ملكية التورنت يحتوي على مسار غير آمن
-
 #. text in torrent_ownership.rs
 #. error when the saved record of a torrent's files differs from the .torrent file
 #, machine
 	The torrent ownership record does not match its file list	سجل ملكية التورنت لا يطابق قائمة ملفاته
-
 #. text in torrent_ownership.rs
 #. error when the saved record of a torrent's files cannot be read as one
 #, machine
 	The torrent ownership record is invalid	سجل ملكية التورنت غير صالح
-
 #. text in torrent downloads
 #. the user refused write permission for existing files when starting a torrent
 #, machine
@@ -3966,11 +3957,6 @@
 #. why an archive wasn't extracted (after "Couldn't extract {name}: "); HatchZip is a program's name
 #, machine
 	there isn't enough free space for its files, HatchZip says; nothing was changed	لا توجد مساحة حرة كافية لملفاته بحسب HatchZip؛ لم يتغير شيء
-
-#. text in torrent downloads
-#. question before starting/resuming a torrent that would modify files without a matching ownership/consent record; Yes authorizes writes, No leaves files unchanged
-#, machine
-	These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?	لا يوجد سجل ملكية أو موافقة مطابق لهذه الملفات. قد يؤدي بدء التورنت إلى تغيير حجمها واستبدال محتواها، بما في ذلك الملفات غير المحددة التي تشترك في الأجزاء. هل تريد استخدام هذه الملفات؟
 #. text in a download's progress window
 	These settings are unavailable when "Show download complete dialog" is turned on	هذه الإعدادات غير متاحة عند تشغيل "إظهار مربع حوار اكتمال التنزيل"
 #. text in helpers.rs
@@ -4084,19 +4070,16 @@
 	this torrent has a file name that isn't safe to write, so it wasn't added: {name}	يحتوي هذا التورنت على اسم ملف غير آمن للكتابة، لذلك لم تتم إضافته: {name}
 #. text in the Add torrent window
 	This torrent is already in the download list	هذا التورنت موجود بالفعل في قائمة التنزيلات
-
 #. message or event log entry in the main window
 #. said when a torrent is added again while an action on the same torrent is still running
 #, machine
 	This torrent is busy. Wait for its current operation to finish before adding it again.	هذا التورنت مشغول. انتظر حتى تنتهي عمليته الحالية قبل إضافته مرة أخرى.
 #. text in errors.rs
 	this torrent is not in the list	هذا التورنت ليس في القائمة
-
 #. text in torrent_ownership.rs
 #. torrent start needs explicit write permission; {file} is the first existing file without a matching grant
 #, machine
 	This torrent needs permission to use {file} before it can start.	يحتاج هذا التورنت إلى إذن لاستخدام {file} قبل أن يبدأ.
-
 #. message or event log entry in the main window; text in a download's Properties window
 #. shown when Move or Rename is refused: a torrent saved straight in Save to shares that folder with other files
 #, machine
@@ -4354,7 +4337,6 @@
 	Use authorization	استخدام التفويض
 #. text in the Options window
 	Use automatic configuration script	استخدام برنامج نصي للضبط التلقائي
-
 #. text in torrent downloads
 #, machine
 	Use existing torrent files	استخدام ملفات التورنت الموجودة
@@ -4739,6 +4721,10 @@
 #. text in the Checksum window
 #. {algorithm} = a checksum algorithm such as "SHA-256" (keep the braces as they are)
 	{file}: the file matches its checksum ({algorithm})	{file}: الملف يطابق بصمته ({algorithm})
+#. text in torrent downloads
+#. said after Delete with files when some files stayed on the disk; {file} is the download's name; the files' paths follow it
+#, machine
+	{file}: these files stayed on the disk, because MDM didn't create them or another download uses them:	{file}: بقيت هذه الملفات على القرص لأن MDM لم ينشئها أو لأن تنزيلاً آخر يستخدمها:
 #. text in a download's progress window
 #. {have} and {total} = numbers of pieces; {size} = one piece's size
 #. {size} = a file size such as "4.2 MB" (keep the braces as they are)
@@ -5983,11 +5969,9 @@ unit	{n} MB/sec	{n} ميغابايت/ثانية
 	Press keys...	اضغط المفاتيح...
 	This shortcut is already in use	هذا الاختصار قيد الاستخدام بالفعل
 	Windows and macOS	Windows و macOS
-
 #. Add torrent: outer folder option
 #, machine
 	Create a folder for this torrent	إنشاء مجلد لهذا التورنت
-
 #. Add torrent: outer folder option
 #, machine
 	This option is available for direct BitTorrent downloads	هذا الخيار متاح لتنزيلات BitTorrent المباشرة

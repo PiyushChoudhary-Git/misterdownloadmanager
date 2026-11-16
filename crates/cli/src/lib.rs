@@ -1597,7 +1597,12 @@ fn mb(b: u64) -> String {
 /// A throwaway torrent session for the command line (its own state folder, nothing kept).
 async fn torrents() -> anyhow::Result<(mdm_torrent::Torrents, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
-    let t = mdm_torrent::Torrents::start(mdm_torrent::Config::new(dir.path().to_owned())).await?;
+    let t = mdm_torrent::Torrents::start(mdm_torrent::Config {
+        // Its own folder, nothing of the person's is there: the engine may open what it makes.
+        require_authorization: false,
+        ..mdm_torrent::Config::new(dir.path().to_owned())
+    })
+    .await?;
     Ok((t, dir))
 }
 

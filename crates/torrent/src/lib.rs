@@ -455,7 +455,9 @@ impl Config {
     /// Everything on, as BitTorrent clients usually are; no proxy, no blocklist.
     pub fn new(state_dir: PathBuf) -> Config {
         Config {
-            require_authorization: false,
+            // Storage opens only the files MDM hands over; a session that has no grant to give
+            // (the command line's throwaway one, the examples) turns this off itself.
+            require_authorization: true,
             state_dir,
             listen: true,
             upnp: true,
@@ -1557,6 +1559,7 @@ mod tests {
             dht: true,
             dht_bootstrap: Some(vec![dht.addr.to_string()]),
             bind: Some(Bind::Address(bound)),
+            require_authorization: false,
             ..Config::new(tmp.path().join("s2"))
         })
         .await
@@ -1647,6 +1650,7 @@ mod tests {
             dht: false,
             proxy: Some(format!("socks5://{}", proxy.addr)),
             bind: Some(Bind::Address(bound)),
+            require_authorization: false,
             ..Config::new(tmp.path().join("s"))
         })
         .await
@@ -1695,6 +1699,7 @@ mod tests {
                 dht: dht_on,
                 dht_bootstrap: Some(vec![dht.addr.to_string()]),
                 bind: Some(Bind::Address(gone)),
+                require_authorization: false,
                 ..Config::new(tmp.path().join(format!("s{n}")))
             })
             .await;
@@ -1739,6 +1744,7 @@ mod tests {
         Config {
             dht: false,
             offline: true,
+            require_authorization: false,
             ..Config::new(state.to_owned())
         }
     }
@@ -2261,6 +2267,7 @@ mod tests {
             dht: false,
             lsd: false,
             listen_ip: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            require_authorization: false,
             ..Config::new(tmp.path().join(dir))
         };
         let t = Torrents::start(Config {
@@ -2299,6 +2306,7 @@ mod tests {
             dht: false,
             lsd: false,
             listen_ip: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            require_authorization: false,
             ..Config::new(tmp.path().join(dir))
         };
         let port = |t: &Torrents| t.listen_addr().expect("listens").port();
@@ -3292,6 +3300,7 @@ mod tests {
                 upnp: false,
                 lsd: false,
                 dht_bootstrap: Some(vec![node.to_string()]),
+                require_authorization: false,
                 ..Config::new(tmp.path().join(dir))
             })
         };

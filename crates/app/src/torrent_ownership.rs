@@ -1,8 +1,9 @@
 //! Deletion authority is a receipt for an object we created, not a torrent path.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
@@ -35,8 +36,9 @@ pub fn identities(
 /// Whether a file now at a torrent's path is another object than the one the engine holds:
 /// only files both sides can identify are compared.
 pub fn swapped(held: &[(usize, Identity)], now: &[(usize, Identity)]) -> bool {
+    let was: HashMap<usize, Identity> = held.iter().copied().collect();
     now.iter()
-        .any(|(i, id)| held.iter().any(|(j, was)| i == j && was != id))
+        .any(|(i, id)| was.get(i).is_some_and(|w| w != id))
 }
 
 /// The object shown in the existing-files question, captured before consent.
@@ -151,10 +153,40 @@ fn root_of(path: &Path) -> Option<String> {
     }
 }
 
+/// What looking at other downloads' files cost once, kept for a batch of checks: a start of
+/// MDM checks every finished torrent against every other one's files, and each look is an open
+/// and a canonicalize.
+#[derive(Default)]
+pub struct ClaimCache(Mutex<HashMap<PathBuf, (PathBuf, Option<Identity>)>>);
+
+impl ClaimCache {
+    fn look(&self, path: &Path) -> (PathBuf, Option<Identity>) {
+        if let Some(found) = self.0.lock().unwrap().get(path) {
+            return found.clone();
+        }
+        let found = (key(path), identity_at(path).ok());
+        self.0
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), found.clone());
+        found
+    }
+}
+
 pub fn conflicts(paths: &[PathBuf], claims: &[PathBuf], canonical: bool) -> Vec<PathBuf> {
+    conflicts_cached(paths, claims, canonical, None)
+}
+
+/// [`conflicts`], looking at each claim once for all the checks that share `cache`.
+pub fn conflicts_cached(
+    paths: &[PathBuf],
+    claims: &[PathBuf],
+    canonical: bool,
+    cache: Option<&ClaimCache>,
+) -> Vec<PathBuf> {
     let normalize = |path: &PathBuf| {
         if canonical {
-            return key(path);
+            return cache.map_or_else(|| key(path), |c| c.look(path).0);
         }
         #[cfg(any(windows, target_os = "macos"))]
         {
@@ -167,14 +199,19 @@ pub fn conflicts(paths: &[PathBuf], claims: &[PathBuf], canonical: bool) -> Vec<
     };
     // Looking at a claim means opening it: leave alone those on another drive than any of the
     // paths asked about, so a sleeping USB stick or a network share is not woken for nothing.
-    let roots: std::collections::HashSet<_> = paths.iter().filter_map(|p| root_of(p)).collect();
+    let roots: HashSet<_> = paths.iter().filter_map(|p| root_of(p)).collect();
     let near: Vec<&PathBuf> = claims
         .iter()
         .filter(|c| !canonical || root_of(c).is_some_and(|r| roots.contains(&r)))
         .collect();
     let set: BTreeSet<_> = near.iter().map(|p| normalize(p)).collect();
-    let identities: std::collections::HashSet<_> = if canonical {
-        near.iter().filter_map(|p| identity_at(p).ok()).collect()
+    let identities: HashSet<_> = if canonical {
+        near.iter()
+            .filter_map(|p| match cache {
+                Some(c) => c.look(p).1,
+                None => identity_at(p).ok(),
+            })
+            .collect()
     } else {
         Default::default()
     };
@@ -280,8 +317,16 @@ impl Ownership {
         let paths = self.paths(folder, dest);
         let mut protected = Vec::new();
         let mut consented = Vec::new();
+        // One look at each path and one lookup of what was agreed to: a torrent of thousands of
+        // files re-added onto files already there must not compare every pair.
+        let agreed: HashMap<&Path, &Consent> =
+            existing.iter().map(|c| (c.path.as_path(), c)).collect();
         for (file, path) in self.files.iter().zip(paths) {
-            let consent = existing.iter().find(|c| c.path == key(&path));
+            let consent = if agreed.is_empty() {
+                None
+            } else {
+                agreed.get(key(&path).as_path()).copied()
+            };
             if path.symlink_metadata().is_ok() || consent.is_some() {
                 protected.push(file.index);
                 if let Some(id) = consent.and_then(|c| c.identity) {
@@ -291,6 +336,46 @@ impl Ownership {
                         identity: id,
                     });
                 }
+            }
+        }
+        self.save(
+            data,
+            &Ledger {
+                version: LEDGER_VERSION,
+                token: self.token.clone(),
+                protected,
+                consented,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A torrent added before ownership records, whose folder MDM made for it (or its one
+    /// file): everything already there was written by MDM's own engine, so it is taken as agreed
+    /// to, once, and never deleted through this record (such a torrent is deleted as it always
+    /// was, by name). Without it, resuming a half-downloaded torrent or sharing a finished one
+    /// after an update would ask about MDM's own files. A record that exists is left alone.
+    pub fn adopt_existing(&self, data: &Path, folder: &Path, dest: &Path) -> io::Result<()> {
+        self.check_token()?;
+        if self.ledger_path(data).exists() {
+            return Ok(());
+        }
+        let mut protected = Vec::new();
+        let mut consented = Vec::new();
+        for (claim, path) in self.files.iter().zip(self.paths(folder, dest)) {
+            let regular = path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_file());
+            if !regular || mdm_torrent::check_relative_path(&claim.path).is_err() {
+                continue;
+            }
+            protected.push(claim.index);
+            if let Ok(identity) = identity_at(&path) {
+                consented.push(Receipt {
+                    index: claim.index,
+                    path: claim.path.clone(),
+                    identity,
+                });
             }
         }
         self.save(
@@ -466,26 +551,7 @@ impl Ownership {
                             path,
                             file,
                         };
-                        // An empty file holds nothing the torrent could cut or overwrite (a
-                        // placeholder, or one MDM made before it could record it), so it is
-                        // used without asking. It stays the person's: it is never deleted.
-                        let empty = !allowed && file.file.metadata().is_ok_and(|m| m.len() == 0);
-                        if empty {
-                            if protected.insert(claim.index) {
-                                new_protected.push(claim.index);
-                            }
-                            owned.remove(&claim.index);
-                            reset.insert(claim.index);
-                            if let Some(id) = id {
-                                owned.entry(claim.index).or_default().push(id);
-                                new_consented.push(Receipt {
-                                    index: claim.index,
-                                    path: claim.path.clone(),
-                                    identity: id,
-                                });
-                            }
-                            opened.push(file);
-                        } else if allowed {
+                        if allowed {
                             opened.push(file);
                         } else {
                             unknown.push(file);
@@ -540,6 +606,14 @@ impl Ownership {
                         });
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        // Whatever won the race must be a plain file, not a link that
+                        // appeared meanwhile.
+                        if !path
+                            .symlink_metadata()
+                            .is_ok_and(|m| m.file_type().is_file())
+                        {
+                            return Err(io::ErrorKind::InvalidInput.into());
+                        }
                         let file = std::fs::OpenOptions::new()
                             .read(true)
                             .write(true)
@@ -567,9 +641,15 @@ impl Ownership {
         result.map(|()| opened)
     }
 
+    /// Make `path` and what is missing above it. Folders at and below `root` (the torrent's
+    /// own) are recorded as made here; those above it (a Save to that doesn't exist yet, or its
+    /// parents) are made as librqbit made them, with no record: they are the person's choice.
     fn mkdirs(root: &Path, path: &Path, made: &mut Vec<Receipt>) -> io::Result<()> {
         if path.exists() {
             return Ok(());
+        }
+        if !path.starts_with(root) {
+            return std::fs::create_dir_all(path);
         }
         if path != root {
             let parent = path.parent().ok_or_else(|| {
@@ -579,6 +659,8 @@ impl Ownership {
                 ))
             })?;
             Self::mkdirs(root, parent, made)?;
+        } else if let Some(parent) = root.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         match std::fs::create_dir(path) {
             Ok(()) => {
@@ -604,19 +686,20 @@ impl Ownership {
     /// afterwards ([`Self::rebind`]): a file someone put in their place is not.
     pub fn verified(&self, data: &Path, folder: &Path, dest: &Path) -> io::Result<Vec<usize>> {
         let ledger = self.load(data)?;
+        let mut recorded: HashMap<usize, Vec<Identity>> = HashMap::new();
+        for r in ledger.files.iter().chain(&ledger.consented) {
+            recorded.entry(r.index).or_default().push(r.identity);
+        }
         let mut ours = Vec::new();
         for (claim, path) in self.files.iter().zip(self.paths(folder, dest)) {
-            let recorded = ledger
-                .files
-                .iter()
-                .chain(&ledger.consented)
-                .filter(|r| r.index == claim.index)
-                .any(|r| {
-                    path.symlink_metadata()
-                        .is_ok_and(|m| m.file_type().is_file())
-                        && identity_at(&path).ok() == Some(r.identity)
-                });
-            if recorded {
+            let Some(ids) = recorded.get(&claim.index) else {
+                continue;
+            };
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_file())
+                && identity_at(&path).is_ok_and(|id| ids.contains(&id))
+            {
                 ours.push(claim.index);
             }
         }
@@ -635,6 +718,8 @@ impl Ownership {
     ) -> io::Result<()> {
         let mut ledger = self.load(data)?;
         let mut changed = false;
+        let verified: HashSet<usize> = verified.iter().copied().collect();
+        let mut now: HashMap<usize, Identity> = HashMap::new();
         for (claim, path) in self.files.iter().zip(self.paths(folder, dest)) {
             if !verified.contains(&claim.index)
                 || !path
@@ -643,19 +728,16 @@ impl Ownership {
             {
                 continue;
             }
-            let Ok(id) = identity_at(&path) else {
-                continue;
-            };
-            for receipt in ledger
-                .files
-                .iter_mut()
-                .chain(ledger.consented.iter_mut())
-                .filter(|r| r.index == claim.index)
+            if let Ok(id) = identity_at(&path) {
+                now.insert(claim.index, id);
+            }
+        }
+        for receipt in ledger.files.iter_mut().chain(ledger.consented.iter_mut()) {
+            if let Some(id) = now.get(&receipt.index)
+                && receipt.identity != *id
             {
-                if receipt.identity != id {
-                    receipt.identity = id;
-                    changed = true;
-                }
+                receipt.identity = *id;
+                changed = true;
             }
         }
         if changed {
@@ -666,7 +748,8 @@ impl Ownership {
 
     /// Delete what this torrent made: the files whose identity still matches their receipt
     /// (all of the torrent's files were made here, ticked or not), then the folders it made,
-    /// when empty. Anything else, and anything another download claims, stays.
+    /// when empty. Anything else, and anything another download claims, stays; the files of
+    /// the torrent that stay are returned, for the person to be told.
     pub fn delete(
         &self,
         data: &Path,
@@ -674,16 +757,24 @@ impl Ownership {
         dest: &Path,
         keep_root: bool,
         protected: &[PathBuf],
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<PathBuf>> {
         let ledger = self.load(data)?;
-        let reserved: BTreeSet<_> = protected.iter().map(|p| key(p)).collect();
-        let identities: std::collections::HashSet<_> = protected
+        // Other downloads' files on another drive can't be this torrent's: leave their drives
+        // asleep.
+        let roots: HashSet<_> = self
+            .paths(folder, dest)
             .iter()
-            .filter_map(|p| identity_at(p).ok())
+            .chain([&folder.to_owned(), &dest.to_owned()])
+            .filter_map(|p| root_of(p))
             .collect();
+        let near: Vec<&PathBuf> = protected
+            .iter()
+            .filter(|p| root_of(p).is_some_and(|r| roots.contains(&r)))
+            .collect();
+        let reserved: BTreeSet<_> = near.iter().map(|p| key(p)).collect();
+        let identities: HashSet<_> = near.iter().filter_map(|p| identity_at(p).ok()).collect();
         let mut failure = None;
-        let protected_files: std::collections::HashSet<usize> =
-            ledger.protected.iter().copied().collect();
+        let protected_files: HashSet<usize> = ledger.protected.iter().copied().collect();
         for receipt in &ledger.files {
             if protected_files.contains(&receipt.index) {
                 continue;
@@ -761,7 +852,16 @@ impl Ownership {
                 }
             }
         }
-        failure.map_or(Ok(()), Err)
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        // What is still at the torrent's paths was not deleted: protected, not MDM's, or
+        // another download's.
+        Ok(self
+            .paths(folder, dest)
+            .into_iter()
+            .filter(|p| p.symlink_metadata().is_ok_and(|m| m.file_type().is_file()))
+            .collect())
     }
 }
 
@@ -921,7 +1021,13 @@ mod tests {
         // The person saves their own file over one of the torrent's (a new object).
         std::fs::rename(root.join("unticked.txt"), tmp.path().join("moved-away")).unwrap();
         std::fs::write(root.join("unticked.txt"), b"user put this here after Add").unwrap();
-        own.delete(&data, &root, &root, true, &[]).unwrap();
+        let kept = own.delete(&data, &root, &root, true, &[]).unwrap();
+        // What stayed is reported, to be told to the person: the file they agreed to use and
+        // the one that took a torrent file's name.
+        assert_eq!(
+            kept,
+            vec![root.join("README.txt"), root.join("unticked.txt")]
+        );
         assert_eq!(
             std::fs::read(root.join("README.txt")).unwrap(),
             b"already here; user consented to reuse"
@@ -1319,28 +1425,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_an_empty_file_is_used_without_asking_and_is_never_deleted() {
+    fn direct_an_empty_file_is_asked_about_like_any_other_and_is_never_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("output");
         std::fs::create_dir(&root).unwrap();
         let own = owner(&["a.bin", "b.bin"]);
         own.initialize(tmp.path(), &root, &root, &[]).unwrap();
-        // A placeholder the person made, and a file with content.
+        // An empty file (a `.gitkeep`, a link, one another program just made) and one with
+        // content: both are the person's until they say otherwise.
         std::fs::write(root.join("a.bin"), b"").unwrap();
         std::fs::write(root.join("b.bin"), b"theirs").unwrap();
         let error = own.prepare(tmp.path(), &root, &root).unwrap_err();
         let asked = take_consent(error).unwrap();
-        // Only the one with content is asked about.
-        assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].index, 1);
-        // Without the other one, the empty one alone starts, and again on the next start.
-        std::fs::remove_file(root.join("b.bin")).unwrap();
+        assert_eq!(asked.len(), 2);
+        // Yes: they are used, and the answer is remembered.
+        assert_eq!(
+            own.prepare_consented(tmp.path(), &root, &root, asked)
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 2);
-        assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 2);
-        // It was the person's: deleting the torrent leaves it.
+        // They were the person's: deleting the torrent leaves them.
         own.delete(tmp.path(), &root, &root, true, &[]).unwrap();
         assert!(root.join("a.bin").exists());
-        assert!(!root.join("b.bin").exists());
+        assert!(root.join("b.bin").exists());
     }
 
     #[test]
@@ -1357,12 +1466,16 @@ mod tests {
             &held,
             &identities(&own.prepare(tmp.path(), &root, &root).unwrap())
         ));
-        // Replaced by another object that is empty (so it is used without asking).
+        // Replaced by another object, which the person agrees to use.
         let path = root.join("a.bin");
         std::fs::rename(&path, tmp.path().join("old")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, b"").unwrap();
-        let now = identities(&own.prepare(tmp.path(), &root, &root).unwrap());
+        let asked = take_consent(own.prepare(tmp.path(), &root, &root).unwrap_err()).unwrap();
+        let now = identities(
+            &own.prepare_consented(tmp.path(), &root, &root, asked)
+                .unwrap(),
+        );
         assert!(swapped(&held, &now));
     }
 
@@ -1481,5 +1594,124 @@ mod tests {
         std::fs::write(folder.join("a.bin"), b"claimed").unwrap();
         delete_outer_folder(&bytes, &folder, &[folder.join("a.bin")]).unwrap();
         assert!(folder.join("a.bin").exists());
+    }
+
+    #[test]
+    fn direct_a_save_to_that_does_not_exist_yet_is_made_and_only_the_torrents_own_folder_is_recorded()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        // RSS and link grabber adds go to a category folder that may not exist: neither the
+        // folder nor its parents (nor a drive's folder that is not plugged in yet).
+        let save_to = tmp.path().join("Downloads").join("Torrents");
+        let folder = save_to.join("Album");
+        let own = owner(&["a.bin", "sub/b.bin"]);
+        own.initialize(tmp.path(), &folder, &folder, &[]).unwrap();
+        own.prepare(tmp.path(), &folder, &folder).unwrap();
+        assert!(folder.join("a.bin").is_file());
+        assert!(folder.join("sub/b.bin").is_file());
+        // Deleting removes what was made for the torrent, not the person's Downloads.
+        own.delete(tmp.path(), &folder, &folder, false, &[])
+            .unwrap();
+        assert!(!folder.exists());
+        assert!(save_to.is_dir(), "Save to was not recorded as made here");
+        // A one-file torrent: its file's folder is made, and stays when the file goes.
+        let direct = tmp.path().join("Other").join("Place");
+        let file = direct.join("x.bin");
+        let own = owner(&["x.bin"]);
+        own.initialize(tmp.path(), &direct, &file, &[]).unwrap();
+        own.prepare(tmp.path(), &direct, &file).unwrap();
+        assert!(file.is_file());
+        own.delete(tmp.path(), &direct, &file, true, &[]).unwrap();
+        assert!(!file.exists());
+        assert!(direct.is_dir());
+        assert!(tmp.path().join("Other").is_dir());
+    }
+
+    #[test]
+    fn direct_a_torrent_added_before_records_takes_the_files_its_engine_wrote_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Album");
+        std::fs::create_dir_all(&root).unwrap();
+        // A half-downloaded torrent of an older MDM: the files are there, sized, non-empty.
+        std::fs::write(root.join("a.bin"), vec![1u8; 4096]).unwrap();
+        std::fs::write(root.join("b.bin"), vec![2u8; 4096]).unwrap();
+        let own = owner(&["a.bin", "b.bin"]);
+        // With no record they would be asked about (another record, so this one stays new).
+        let probe = owner(&["a.bin", "b.bin"]);
+        assert!(take_consent(probe.prepare(tmp.path(), &root, &root).unwrap_err()).is_ok());
+        own.adopt_existing(tmp.path(), &root, &root).unwrap();
+        assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 2);
+        // Their bytes are untouched, and they are never deleted through this record.
+        assert_eq!(std::fs::read(root.join("a.bin")).unwrap().len(), 4096);
+        let kept = own.delete(tmp.path(), &root, &root, true, &[]).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(root.join("a.bin").exists() && root.join("b.bin").exists());
+        // Once: a record that exists is not widened. A file that takes a name later is a
+        // stranger's, and is asked about.
+        std::fs::rename(root.join("a.bin"), tmp.path().join("old")).unwrap();
+        std::fs::write(root.join("a.bin"), b"another program's").unwrap();
+        own.adopt_existing(tmp.path(), &root, &root).unwrap();
+        assert!(own.prepare(tmp.path(), &root, &root).is_err());
+    }
+
+    #[test]
+    fn direct_files_agreed_to_at_add_are_looked_up_not_compared_pair_by_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Big");
+        std::fs::create_dir_all(&root).unwrap();
+        let names: Vec<String> = (0..3000).map(|i| format!("f{i}.bin")).collect();
+        for name in &names {
+            std::fs::write(root.join(name), b"already here").unwrap();
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let own = owner(&refs);
+        let paths: Vec<PathBuf> = names.iter().map(|n| root.join(n)).collect();
+        let existing = consent_for(&paths);
+        let started = std::time::Instant::now();
+        own.initialize(tmp.path(), &root, &root, &existing).unwrap();
+        // Comparing every pair (each with its own look at the disk) took tens of seconds here.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 3000);
+    }
+
+    #[test]
+    fn direct_other_downloads_files_are_looked_at_once_for_a_batch_and_give_the_same_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Shared");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.bin"), b"x").unwrap();
+        let mine = vec![root.join("a.bin"), root.join("b.bin")];
+        let claims = vec![root.join("A.BIN"), root.join("c.bin")];
+        let cache = ClaimCache::default();
+        let plain = conflicts(&mine, &claims, true);
+        // The same cache serves every check of the batch.
+        for _ in 0..3 {
+            assert_eq!(conflicts_cached(&mine, &claims, true, Some(&cache)), plain);
+        }
+        assert!(!plain.contains(&root.join("b.bin")));
+    }
+
+    #[test]
+    fn direct_swapped_verified_and_rebind_agree_with_what_they_did_before_on_a_big_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Big");
+        std::fs::create_dir_all(&root).unwrap();
+        let names: Vec<String> = (0..2000).map(|i| format!("f{i}.bin")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let own = owner(&refs);
+        own.initialize(tmp.path(), &root, &root, &[]).unwrap();
+        let held = identities(&own.prepare(tmp.path(), &root, &root).unwrap());
+        assert!(!swapped(&held, &held));
+        let verified = own.verified(tmp.path(), &root, &root).unwrap();
+        assert_eq!(verified.len(), 2000);
+        own.rebind(tmp.path(), &verified, &root, &root).unwrap();
+        // One file replaced: it is no longer verified.
+        std::fs::rename(root.join("f7.bin"), tmp.path().join("old")).unwrap();
+        std::fs::write(root.join("f7.bin"), b"other").unwrap();
+        assert_eq!(own.verified(tmp.path(), &root, &root).unwrap().len(), 1999);
     }
 }

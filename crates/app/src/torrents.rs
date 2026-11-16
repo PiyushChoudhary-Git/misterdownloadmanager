@@ -745,6 +745,7 @@ impl Host {
             .unwrap()
             .insert(owner.token.clone(), rx);
         let (folder, dest) = (spec.folder.clone(), dest.to_owned());
+        let (initializing, token) = (self.initializing.clone(), owner.token.clone());
         rt.spawn_blocking(move || {
             let result = state_dir()
                 .ok_or_else(|| crate::i18n::t("no data folder").to_owned())
@@ -754,6 +755,8 @@ impl Host {
                         .map_err(|e| e.to_string())
                 });
             tx.send_replace(Some(result));
+            // Whoever waits has the answer; a failure doesn't stay until MDM is restarted.
+            initializing.lock().unwrap().remove(&token);
         });
     }
 
@@ -1014,29 +1017,54 @@ impl Host {
             let Ok(t) = host.session(known).await else {
                 return;
             };
+            // The other downloads' files are looked at once for the whole batch.
+            let cache = Arc::new(crate::torrent_ownership::ClaimCache::default());
             for job in jobs {
                 let h = job.spec.hash.clone();
                 if !on {
                     let _ = t.remove(&h, false).await;
                 } else if t.has(&h) {
                     let _ = t.resume(&h).await;
-                } else if !host.busy(&h)
-                    && let Err(e) = host.share(&t, &job).await
-                {
-                    tracing::info!("torrents: {h} is not shared again: {e}");
+                } else if host.hold(&h) {
+                    // Held like any action: a delete in the first seconds waits for it, instead
+                    // of finding the files made again under it.
+                    let shared = host.share(&t, &job, &cache).await;
+                    host.busy.lock().unwrap().remove(&h);
+                    if let Err(e) = shared {
+                        tracing::info!("torrents: {h} is not shared again: {e}");
+                    }
                 }
             }
         });
     }
 
-    async fn share(&self, t: &Arc<Torrents>, job: &ShareJob) -> Result<(), String> {
+    /// Take the busy guard for `hash`, unless an action or a deletion already has it.
+    fn hold(&self, hash: &str) -> bool {
+        !self.deleting.lock().unwrap().contains_key(hash)
+            && self.busy.lock().unwrap().insert(hash.to_owned())
+    }
+
+    async fn share(
+        &self,
+        t: &Arc<Torrents>,
+        job: &ShareJob,
+        cache: &Arc<crate::torrent_ownership::ClaimCache>,
+    ) -> Result<(), String> {
         let mut protected = self.deletion_claims();
         for (id, paths) in job.claims.iter() {
             if *id != job.id {
                 protected.extend(paths.iter().cloned());
             }
         }
-        prepare_storage_as(self, &job.spec, &job.dest, protected, false).await?;
+        prepare_storage_as(
+            self,
+            &job.spec,
+            &job.dest,
+            protected,
+            false,
+            Some(cache.clone()),
+        )
+        .await?;
         let bytes = read_kept(&job.spec.hash).await?;
         t.add(
             &bytes,
@@ -1110,9 +1138,20 @@ impl Host {
             }
             .await;
             match result {
-                Ok(()) => {
+                Ok(kept) => {
                     if let Some(dir) = rename_dir {
                         mdm_torrent::rename_plugin::remove_renamed_file(&dir, &spec.hash);
+                    }
+                    if !kept.is_empty() {
+                        crate::dialogs::tell(
+                            crate::i18n::mark("Delete"),
+                            crate::i18n::fmt(
+                                // i18n: said after Delete with files when some files stayed on the disk; {file} is the download's name; the files' paths follow it
+                                crate::i18n::t("{file}: these files stayed on the disk, because MDM didn't create them or another download uses them:"),
+                                &[("file", &crate::i18n::isolate(&name))],
+                            ) + "\n\n"
+                                + &file_list(kept.iter().map(|p| p.as_path())),
+                        );
                     }
                 }
                 Err(error) => crate::dialogs::tell(
@@ -1141,7 +1180,7 @@ async fn forget_torrent(
     files: bool,
     protected: Vec<PathBuf>,
     data: PathBuf,
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     if let Some(t) = session
         && t.has(&spec.hash)
     {
@@ -1155,6 +1194,7 @@ async fn forget_torrent(
     // Nothing of this torrent may be opened by the engine on an old grant from now on.
     revoke_grant(&spec.hash);
     tokio::task::spawn_blocking(move || {
+        let mut kept = Vec::new();
         if files {
             let file = file.as_ref().ok_or_else(|| {
                 crate::i18n::t("the .torrent file kept for it is gone").to_owned()
@@ -1176,7 +1216,7 @@ async fn forget_torrent(
                     owner
                         .validate(&bytes, &spec.hash)
                         .map_err(|e| e.to_string())?;
-                    owner
+                    kept = owner
                         .delete(
                             &data,
                             &spec.folder,
@@ -1218,10 +1258,44 @@ async fn forget_torrent(
         if let Some(owner) = &spec.ownership {
             owner.forget(&data).map_err(|e| e.to_string())?;
         }
-        Ok(())
+        Ok(kept)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// A torrent added before ownership records whose files MDM's own engine wrote: it has its
+/// outer folder (the one MDM made for it) or is one file. What is at its paths is taken as
+/// agreed to; a torrent saved straight in Save to (new in this version) never qualifies.
+fn owns_what_is_there(
+    spec: &TorrentSpec,
+    owner: &crate::torrent_ownership::Ownership,
+    dest: &Path,
+) -> bool {
+    spec.ownership.is_none()
+        && (owner.files.len() == 1 || (spec.create_subfolder && spec.folder == dest))
+}
+
+/// Up to eight paths, one to a line, then how many more: for a question or a notice.
+fn file_list<'a>(paths: impl ExactSizeIterator<Item = &'a Path>) -> String {
+    let total = paths.len();
+    let mut text = String::new();
+    for path in paths.take(8) {
+        text.push_str(&crate::i18n::isolate(&path.display().to_string()));
+        text.push('\n');
+    }
+    if total > 8 {
+        text.push_str(&crate::i18n::fmt(
+            // i18n: number of additional files in a list of files
+            &crate::i18n::tn(
+                (total - 8) as u64,
+                "And {n} other file.",
+                "And {n} other files.",
+            ),
+            &[("n", &crate::i18n::integer((total - 8) as u64))],
+        ));
+    }
+    text
 }
 
 /// A finished torrent to share again: its row, and what every row of the list claims (by row),
@@ -1258,7 +1332,7 @@ async fn prepare_storage(
     dest: &Path,
     protected: Vec<PathBuf>,
 ) -> Result<bool, String> {
-    prepare_storage_as(host, spec, dest, protected, true).await
+    prepare_storage_as(host, spec, dest, protected, true, None).await
 }
 
 /// [`prepare_storage`]; `ask` false (nobody is there to answer: sharing at start) stops at the
@@ -1269,6 +1343,7 @@ async fn prepare_storage_as(
     dest: &Path,
     protected: Vec<PathBuf>,
     ask: bool,
+    cache: Option<Arc<crate::torrent_ownership::ClaimCache>>,
 ) -> Result<bool, String> {
     if let Some(owner) = &spec.ownership {
         host.ownership_ready(owner).await?;
@@ -1292,10 +1367,11 @@ async fn prepare_storage_as(
     let (scan_owner, scan_folder, scan_dest) =
         (owner.clone(), spec.folder.clone(), dest.to_owned());
     let collision = tokio::task::spawn_blocking(move || {
-        crate::torrent_ownership::conflicts(
+        crate::torrent_ownership::conflicts_cached(
             &scan_owner.paths(&scan_folder, &scan_dest),
             &protected,
             true,
+            cache.as_deref(),
         )
     })
     .await
@@ -1306,6 +1382,20 @@ async fn prepare_storage_as(
             "Another download already claims this torrent's destination",
         )
         .to_owned());
+    }
+    // Added before ownership records, with the folder MDM made for it (or one file): what is
+    // there, MDM's own engine wrote, so resuming or sharing it after an update asks nothing.
+    if owns_what_is_there(spec, &owner, dest) {
+        let (owner3, data3, folder3, dest3) = (
+            owner.clone(),
+            data.clone(),
+            spec.folder.clone(),
+            dest.to_owned(),
+        );
+        tokio::task::spawn_blocking(move || owner3.adopt_existing(&data3, &folder3, &dest3))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
     }
     let mut fresh = Vec::new();
     for _ in 0..3 {
@@ -1363,25 +1453,11 @@ async fn prepare_storage_as(
                     ).to_owned());
                 }
                 let mut text = crate::i18n::t(
-                    // i18n: question before starting/resuming a torrent that would modify files without a matching ownership/consent record; Yes authorizes writes, No leaves files unchanged
-                    "These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?",
+                    // i18n: question before starting/resuming a torrent that would modify files MDM did not create; Yes authorizes writes, No leaves files unchanged
+                    "MDM didn't create these files. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use them for this torrent?",
                 ).to_owned();
                 text.push_str("\n\n");
-                for file in files.iter().take(8) {
-                    text.push_str(&crate::i18n::isolate(&file.path.display().to_string()));
-                    text.push('\n');
-                }
-                if files.len() > 8 {
-                    text.push_str(&crate::i18n::fmt(
-                        // i18n: number of additional files in the torrent reuse confirmation
-                        &crate::i18n::tn(
-                            (files.len() - 8) as u64,
-                            "And {n} other file.",
-                            "And {n} other files.",
-                        ),
-                        &[("n", &crate::i18n::integer((files.len() - 8) as u64))],
-                    ));
-                }
+                text.push_str(&file_list(files.iter().map(|f| f.path.as_path())));
                 if !crate::dialogs::confirm(crate::i18n::mark("Use existing torrent files"), text)
                     .await
                 {
@@ -1797,7 +1873,7 @@ pub fn direct_magnet_url(hash: &str, name: &str) -> url::Url {
 }
 
 pub fn mark_direct(url: &mut url::Url) {
-    if !url_marks_direct(url) {
+    if url.scheme() == "magnet" && !url_marks_direct(url) {
         url.query_pairs_mut().append_pair(DIRECT_MARK, "direct");
     }
 }
@@ -1850,6 +1926,37 @@ mod tests {
             in_order: false,
             ends_first: true,
         }
+    }
+
+    #[test]
+    fn direct_only_an_older_torrent_with_its_own_folder_or_one_file_takes_what_is_there() {
+        use crate::torrent_ownership::{Claim, Ownership};
+        let owner = |n: usize| Ownership {
+            token: "0".repeat(64),
+            files: (0..n)
+                .map(|index| Claim {
+                    index,
+                    path: format!("f{index}").into(),
+                })
+                .collect(),
+        };
+        let dest = PathBuf::from("f");
+        // Added before records, with the outer folder MDM made: its own engine wrote the files.
+        assert!(owns_what_is_there(&a_spec(), &owner(3), &dest));
+        // Added before records, one file.
+        let mut other = a_spec();
+        other.folder = "elsewhere".into();
+        assert!(owns_what_is_there(&other, &owner(1), &dest));
+        // Saved straight in Save to: never a torrent of an older MDM.
+        let mut direct = a_spec();
+        direct.create_subfolder = false;
+        assert!(!owns_what_is_there(&direct, &owner(3), &dest));
+        // A folder that is not the torrent's destination is not its own.
+        assert!(!owns_what_is_there(&other, &owner(3), &dest));
+        // A torrent with a record is asked about what is not its own, as always.
+        let mut recorded = a_spec();
+        recorded.ownership = Some(owner(3));
+        assert!(!owns_what_is_there(&recorded, &owner(3), &dest));
     }
 
     #[tokio::test]
@@ -1946,6 +2053,10 @@ mod tests {
         let direct = direct_magnet_url(hash, "Set");
         assert!(!url_marks_direct(&plain));
         assert!(url_marks_direct(&direct));
+        // The mark is a magnet's: another address is left as it is, not marked at every load.
+        let mut web = url::Url::parse("https://example.org/a.torrent").unwrap();
+        mark_direct(&mut web);
+        assert_eq!(web.as_str(), "https://example.org/a.torrent");
         // What an older build saves of a row: the address, but not the fields it does not know.
         let older: TorrentSpec = serde_json::from_str(&format!(
             r#"{{"hash":"{hash}","files":null,"folder":"Downloads"}}"#
@@ -2010,6 +2121,7 @@ mod tests {
             Torrents::start(Config {
                 offline: true,
                 dht: false,
+                require_authorization: false,
                 ..Config::new(tmp.path().join("session"))
             })
             .await

@@ -11,7 +11,7 @@
 #. {n} = a number (keep the braces as they are)
 @plural	An unknown site wants to send {n} link to Link grabber.|An unknown site wants to send {n} links to Link grabber.	An unknown site wants to send {n} link to Link grabber.|An unknown site wants to send {n} links to Link grabber.
 #. count in torrent downloads
-#. number of additional files in the torrent reuse confirmation
+#. number of additional files in a list of files
 #. {n} = a number (keep the braces as they are)
 @plural	And {n} other file.|And {n} other files.	And {n} other file.|And {n} other files.
 #. count in a dialog box
@@ -2109,6 +2109,9 @@
 #. text in remote.rs
 #. remote control page (on a phone): an action failed
 	MDM could not do it.	MDM could not do it.
+#. text in torrent downloads
+#. question before starting/resuming a torrent that would modify files MDM did not create; Yes authorizes writes, No leaves files unchanged
+	MDM didn't create these files. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use them for this torrent?	MDM didn't create these files. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use them for this torrent?
 #. text in remote.rs
 #. remote control page (on a phone): MDM can't be reached while pairing
 	MDM does not answer. Check that it is running and on the same network.	MDM does not answer. Check that it is running and on the same network.
@@ -3809,9 +3812,6 @@
 #. text in extracting archives (a download's log, the Archive password window)
 #. why an archive wasn't extracted (after "Couldn't extract {name}: "); HatchZip is a program's name
 	there isn't enough free space for its files, HatchZip says; nothing was changed	there isn't enough free space for its files, HatchZip says; nothing was changed
-#. text in torrent downloads
-#. question before starting/resuming a torrent that would modify files without a matching ownership/consent record; Yes authorizes writes, No leaves files unchanged
-	These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?	These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?
 #. text in a download's progress window
 	These settings are unavailable when "Show download complete dialog" is turned on	These settings are unavailable when "Show download complete dialog" is turned on
 #. text in helpers.rs
@@ -4537,6 +4537,9 @@
 #. text in the Checksum window
 #. {algorithm} = a checksum algorithm such as "SHA-256" (keep the braces as they are)
 	{file}: the file matches its checksum ({algorithm})	{file}: the file matches its checksum ({algorithm})
+#. text in torrent downloads
+#. said after Delete with files when some files stayed on the disk; {file} is the download's name; the files' paths follow it
+	{file}: these files stayed on the disk, because MDM didn't create them or another download uses them:	{file}: these files stayed on the disk, because MDM didn't create them or another download uses them:
 #. text in a download's progress window
 #. {have} and {total} = numbers of pieces; {size} = one piece's size
 #. {size} = a file size such as "4.2 MB" (keep the braces as they are)

@@ -33,10 +33,20 @@ pub fn torrent_file_identity(file: &std::fs::File) -> std::io::Result<[u64; 5]> 
     ])
 }
 
+/// The identity of the plain file at `path`. Anything else there (a pipe, a device, a link)
+/// has none and is not opened: opening a FIFO with nobody writing to it waits for ever, and
+/// the torrent would stay busy until MDM was restarted.
 pub fn torrent_file_identity_at(path: &Path) -> std::io::Result<[u64; 5]> {
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     torrent_file_identity(&std::fs::File::open(path)?)
 }
 
+/// Delete `path` when it is still the object whose identity is `expected`. POSIX can't delete
+/// through a handle: the identity is checked, then the file is removed by name, so a rename in
+/// that gap by another program can still make this remove the wrong file. (Windows deletes
+/// through the verified handle.)
 pub fn remove_owned_torrent_file(path: &Path, expected: [u64; 5]) -> std::io::Result<bool> {
     let file = std::fs::File::open(path)?;
     if torrent_file_identity(&file)? != expected || torrent_file_identity_at(path)? != expected {
