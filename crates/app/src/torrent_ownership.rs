@@ -1659,7 +1659,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Big");
         std::fs::create_dir_all(&root).unwrap();
-        let names: Vec<String> = (0..3000).map(|i| format!("f{i}.bin")).collect();
+        let names: Vec<String> = (0..1500).map(|i| format!("f{i}.bin")).collect();
         for name in &names {
             std::fs::write(root.join(name), b"already here").unwrap();
         }
@@ -1669,13 +1669,14 @@ mod tests {
         let existing = consent_for(&paths);
         let started = std::time::Instant::now();
         own.initialize(tmp.path(), &root, &root, &existing).unwrap();
-        // Comparing every pair (each with its own look at the disk) took tens of seconds here.
+        // Comparing every pair (each with its own look at the disk) took about 8 s at this
+        // size; looking each path up once takes a fraction of a second.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(15),
+            started.elapsed() < std::time::Duration::from_secs(4),
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 3000);
+        assert_eq!(own.prepare(tmp.path(), &root, &root).unwrap().len(), 1500);
     }
 
     #[test]
@@ -1700,18 +1701,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Big");
         std::fs::create_dir_all(&root).unwrap();
-        let names: Vec<String> = (0..2000).map(|i| format!("f{i}.bin")).collect();
+        let names: Vec<String> = (0..1000).map(|i| format!("f{i}.bin")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let own = owner(&refs);
         own.initialize(tmp.path(), &root, &root, &[]).unwrap();
         let held = identities(&own.prepare(tmp.path(), &root, &root).unwrap());
         assert!(!swapped(&held, &held));
         let verified = own.verified(tmp.path(), &root, &root).unwrap();
-        assert_eq!(verified.len(), 2000);
+        assert_eq!(verified.len(), 1000);
         own.rebind(tmp.path(), &verified, &root, &root).unwrap();
         // One file replaced: it is no longer verified.
         std::fs::rename(root.join("f7.bin"), tmp.path().join("old")).unwrap();
         std::fs::write(root.join("f7.bin"), b"other").unwrap();
-        assert_eq!(own.verified(tmp.path(), &root, &root).unwrap().len(), 1999);
+        assert_eq!(own.verified(tmp.path(), &root, &root).unwrap().len(), 999);
     }
 }
