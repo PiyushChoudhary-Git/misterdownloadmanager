@@ -2949,6 +2949,16 @@ impl App {
     /// `/show <window>` (mdm_ipc::Command::show): open one of the windows by name, as its menu
     /// command does. Unknown names do nothing.
     fn show_named(&mut self, name: &str, ctx: &egui::Context) {
+        // MDM_CRASH_TEST=1 only (crash.rs): a stall in a later tick of the window hidden in the
+        // notification area (#1126), which this hides rather than shows.
+        if crate::crash::testing()
+            && let Some(test) = name.strip_prefix("crash-test:")
+            && test.starts_with("hidden-")
+        {
+            self.hide_to_tray(ctx);
+            crate::crash::test(test);
+            return;
+        }
         self.show_window(ctx);
         let first = self.items.first().map(|i| i.id);
         let last = self.items.last().map(|i| i.id);
@@ -4344,6 +4354,9 @@ impl App {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // X11: out of the window list too, when it was minimized (#1255).
+        #[cfg(target_os = "linux")]
+        crate::unix::withdraw_main_window();
         self.hidden = true;
         self.start_trimming();
     }
@@ -4362,6 +4375,8 @@ impl App {
         self.at_login = None;
         self.trim_when_hidden = None;
         self.hidden = false;
+        // The freeze watchdog: from here a stall is seen (no longer the computer's, #1126).
+        crate::crash::hidden(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         if !crate::offscreen() {
@@ -4725,6 +4740,9 @@ impl App {
         if minimize && !self.hidden {
             tracing::info!("minimized to the notification area");
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // X11: a minimized window stays in the window list unless withdrawn (#1255).
+            #[cfg(target_os = "linux")]
+            crate::unix::withdraw_main_window();
             self.hidden = true;
             self.start_trimming();
         }
@@ -6746,10 +6764,10 @@ impl App {
             });
         }
         if let Some(action @ ("start_queue" | "stop_queue")) = cmd.action.as_deref() {
-            let at = cmd
-                .queue
-                .as_deref()
-                .and_then(|n| self.queues.iter().position(|q| q.name == n));
+            let at = match cmd.queue.as_deref() {
+                Some(n) => self.queues.iter().position(|q| q.name == n),
+                None => (!self.queues.is_empty()).then_some(0),
+            };
             let Some(q) = at else {
                 return line(&ErrorAnswer {
                     error: "no such queue".into(),
@@ -12200,6 +12218,10 @@ impl App {
         // The freeze watchdog times this as it times `ui` (crash.rs): a command or the clock
         // that hangs is reported too, minimized or not (#202).
         crate::crash::logic_begin();
+        // Whether a stall now could be seen: every window of MDM's hidden (the main window in
+        // the notification area, no other window open) is felt by nobody (#1126).
+        crate::crash::hidden(self.hidden && ctx.input(|i| i.raw.viewports.len() <= 1));
+        crate::crash::armed();
         crate::crash::step(crate::crash::Step::Commands);
         let mut handled = false;
         // A command that may open a window (not a question answered at once).

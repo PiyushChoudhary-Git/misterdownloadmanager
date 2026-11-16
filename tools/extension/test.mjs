@@ -1937,6 +1937,29 @@ const videoPageOn = (() => {
   ok("in-place navigation and YouTube's player: the video playing now, or nothing");
 }
 
+// #1271: the player the background asks on YouTube (playingAt, run in the page) is the one at the
+// point video.js sends. YouTube's main player under its home page has no box (the window's
+// corner, 0,0) and still names the video watched last; a hover preview it stopped has none either
+// (hidden in a container of no size). Neither is at any point, the corner included: the preview
+// playing there is, and with nothing there the address video.js named (the card's link) goes.
+{
+  const source = code.slice(code.indexOf("function playingAt("), code.indexOf("const isYouTube"));
+  const page = (...videos) => new Function("document", `${source}
+return playingAt;`)({ querySelectorAll: () => videos });
+  const video = (id, left, top, width, height) => ({
+    getBoundingClientRect: () => ({ left, top, right: left + width, bottom: top + height, width, height }),
+    closest: () => ({ getVideoData: () => ({ video_id: id }) }),
+  });
+  const main = video("watchedLast", 0, 0, 0, 0);
+  const stopped = page(main, video("thePreview1", 0, 0, 0, 0));
+  assert.equal(stopped(0, 0), "", "the corner: no player there");
+  assert.equal(stopped(660, 239), "", "where the stopped preview was");
+  const playing = page(main, video("thePreview1", 476, 135, 369, 208));
+  assert.equal(playing(660, 239), "thePreview1", "the preview playing there");
+  assert.equal(playing(0, 0), "");
+  ok("#1271: YouTube's player at a point: one with no box is at none");
+}
+
 // A small DOM for the sample pages (tools/extension/feeds): elements with their attributes, open
 // shadow roots (<template shadowrootmode>), `a.href`, and querySelector(All) with the simple
 // selectors video.js uses (a tag, #id, [attr], [attr="v"], [attr*="v"], [attr^="v"], lists).
@@ -2158,7 +2181,9 @@ function samplePage(html) {
 function videoButton({ stored = {} } = {}) {
   const source = readFileSync(new URL("../../extension/video.js", import.meta.url), "utf8");
   const handlers = {};
-  const queued = [];
+  // The frames asked for, by id: one cancelled since (a tick after a hide) does not run.
+  const frames = new Map();
+  let frameId = 0;
   let root = null;
   const node = (name = "") => {
     const style = new Map();
@@ -2277,8 +2302,8 @@ function videoButton({ stored = {} } = {}) {
     document: doc,
     matchMedia: () => ({ matches: false, addEventListener() {} }),
     getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }),
-    requestAnimationFrame: (f) => (queued.push(f), queued.length),
-    cancelAnimationFrame: () => {},
+    requestAnimationFrame: (f) => (frames.set(++frameId, f), frameId),
+    cancelAnimationFrame: (id) => frames.delete(id),
     addEventListener: (n, f) => ((handlers[n] = handlers[n] || []).push(f)),
     removeEventListener: () => {},
     setTimeout,
@@ -2292,11 +2317,16 @@ function videoButton({ stored = {} } = {}) {
     console: quietConsole,
   });
   // The pointer over the video, up to the button's question being answered: only its look runs
-  // (its tick would ask for another frame).
+  // (its tick would ask for another frame). Each move lands a pixel to the side, as the script
+  // ignores a move at the same spot (#741).
+  let moved = 0;
   const move = async () => {
-    for (const f of handlers.pointermove || []) f({ clientX: 320, clientY: 180 });
-    assert.ok(queued.length, "the look queued");
-    await queued.shift()();
+    moved += 1;
+    for (const f of handlers.pointermove || []) f({ clientX: 320 + (moved % 2), clientY: 180 });
+    assert.ok(frames.size, "the look queued");
+    const [id, look] = [...frames].pop();
+    frames.delete(id);
+    await look();
     await settle();
   };
   return {
@@ -2318,20 +2348,25 @@ function videoButton({ stored = {} } = {}) {
   };
 }
 {
-  // Off, as installed: the button shows in full screen, placed there or entering it afterwards.
+  // Off, as installed: the button shows in full screen once the pointer moves, and entering full
+  // screen leaves it out of the way until then.
   const b = videoButton();
   b.setFullscreen(true);
   await b.move();
   assert.equal(b.display(), "block", "off: the button shows in full screen");
   b.setFullscreen(false);
   await b.fullscreenchange();
+  await b.move();
+  assert.equal(b.display(), "block", "off, not fullscreen: the button shows");
   b.setFullscreen(true);
   await b.fullscreenchange();
-  assert.equal(b.display(), "block", "off: entering full screen keeps it");
-  ok("#670: with the option off, the button shows in full screen");
+  assert.equal(b.display(), "none", "off: entering full screen hides it");
+  await b.move();
+  assert.equal(b.display(), "block", "off: the pointer's next move brings it back");
+  ok("#670: with the option off, the button shows in full screen once the pointer moves");
 }
 {
-  // On: it never shows while the page is in full screen — entering it hides a placed button,
+  // On: it never shows while the page is in full screen: entering it hides a placed button,
   // leaving it shows the button again.
   const b = videoButton({ stored: { hideVideoFullscreen: true } });
   await b.move();
@@ -2583,6 +2618,21 @@ function videoButton({ stored = {} } = {}) {
   assert.equal(pointerTarget(next, null, false), next);
   assert.equal(pointerTarget(null, mine, false), null);
   assert.ok(fn("look").includes("pointerTarget(videoAt(pointer.x, pointer.y), video, menuOpen)"), "look: kept on its video while its menu is open");
+  // #1271: where the background asks the page's player what the click's video is (the window's
+  // message): its middle while it has a box on the screen; a hover preview the page stopped as
+  // the pointer went to the button (taken out, or hidden in a container of no size) is at the
+  // point the click was taken at, never the window's corner (YouTube's main player there names
+  // the video watched last).
+  const middle = make(["middle"], "middle");
+  const shown = (left, top, width, height, isConnected = true) => ({ isConnected, getBoundingClientRect: () => ({ left, top, width, height }) });
+  const was = { x: 660, y: 239 };
+  assert.deepEqual(middle(shown(100, 50, 640, 360), was), { x: 420, y: 230 }, "a video on the screen: its middle now");
+  assert.deepEqual(middle(shown(0, 0, 0, 0), was), was, "a stopped preview, hidden");
+  assert.deepEqual(middle(shown(476, 135, 369, 0), was), was, "no height");
+  assert.deepEqual(middle(shown(476, 135, 369, 208, false), was), was, "taken out of the page");
+  assert.equal(middle(shown(0, 0, 0, 0), undefined), undefined, "nowhere known: no point");
+  assert.ok(fn("useWindow").includes("at: middle(j.video, j.asked.at)"), "useWindow: the point the click was taken at, for a video gone");
+  assert.ok(/const d = held \? held\.d : describe\(/.test(fn("download")), "download: a held video's own (#503), its point with it");
   // What a page can never make it do: the menu's rows and keys take only the user's own clicks
   // and keys; rows are text (markup only for the fixed parts); a pick sends the token and the
   // row's number alone; nothing is asked on a timer of its own, nor before a click.
