@@ -519,15 +519,20 @@ fn torrent_claims(
 ) -> Vec<PathBuf> {
     let mut paths = host.deletion_claims();
     for item in items.iter().filter(|i| Some(i.id) != except) {
-        if let Some(spec) = &item.torrent
-            && let Some(owner) = &spec.ownership
-        {
-            paths.extend(owner.paths(&spec.folder, &item.dest));
-        } else if !item.dest.as_os_str().is_empty() {
-            paths.push(item.dest.clone());
-        }
+        item_claims(item, &mut paths);
     }
     paths
+}
+
+/// What one row claims on the disk: the files of a torrent with a record, else its path.
+fn item_claims(item: &Item, paths: &mut Vec<PathBuf>) {
+    if let Some(spec) = &item.torrent
+        && let Some(owner) = &spec.ownership
+    {
+        paths.extend(owner.paths(&spec.folder, &item.dest));
+    } else if !item.dest.as_os_str().is_empty() {
+        paths.push(item.dest.clone());
+    }
 }
 
 /// What is said when a download can't move, or stays while the others of a selection move.
@@ -5826,14 +5831,31 @@ impl App {
     /// The list's finished torrents (what "keep sharing" shares).
     /// The finished torrents to share (Torrent settings' "Keep sharing"): those that haven't
     /// reached a seeding limit.
-    fn complete_torrents(&self) -> Vec<String> {
+    fn complete_torrents(&self) -> Vec<crate::torrents::ShareJob> {
         let limits = self.settings.sharing_limits();
+        let claims = std::sync::Arc::new(
+            self.items
+                .iter()
+                .map(|i| {
+                    let mut paths = Vec::new();
+                    item_claims(i, &mut paths);
+                    (i.id, paths)
+                })
+                .collect::<Vec<_>>(),
+        );
         self.items
             .iter()
             .filter(|i| i.status == Status::Complete)
-            .filter_map(|i| i.torrent.as_ref().map(|t| (t, i.downloaded)))
-            .filter(|(t, done)| crate::torrents::sharing_limit_reached(t, *done, limits).is_none())
-            .map(|(t, _)| t.hash.clone())
+            .filter_map(|i| i.torrent.as_ref().map(|t| (i, t)))
+            .filter(|(i, t)| {
+                crate::torrents::sharing_limit_reached(t, i.downloaded, limits).is_none()
+            })
+            .map(|(i, t)| crate::torrents::ShareJob {
+                id: i.id,
+                spec: t.clone(),
+                dest: i.dest.clone(),
+                claims: claims.clone(),
+            })
             .collect()
     }
 

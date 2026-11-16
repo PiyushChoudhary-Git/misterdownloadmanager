@@ -2020,6 +2020,112 @@ mod tests {
         authorized_storage::forget(&session, &meta.info_hash);
     }
 
+    /// A finished torrent is not restored when MDM starts (the engine opens only what the app
+    /// has checked), so the app checks it and adds it again: it is back in the session, finished
+    /// from its files as they are, none of them changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_torrent_is_shared_again_after_a_restart_once_it_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(source.join("a.bin"), vec![3u8; 40_000]).unwrap();
+        std::fs::write(source.join("b.bin"), vec![5u8; 40_000]).unwrap();
+        let bytes = make_torrent(&source).await;
+        let state = tmp.path().join("state");
+        let session = state.join("session");
+        let handed = |t: Meta| -> Vec<authorized_storage::PreparedFile> {
+            t.files
+                .iter()
+                .enumerate()
+                .map(|(index, f)| {
+                    let path = output.join(&f.path);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    authorized_storage::PreparedFile {
+                        index,
+                        file: std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                            .unwrap(),
+                        path,
+                    }
+                })
+                .collect()
+        };
+        // The person's finished download: its files are all there.
+        let mut config = offline(&state);
+        config.require_authorization = true;
+        let t = Torrents::start(config).await.unwrap();
+        let meta = t
+            .metadata(&Source::File(bytes.clone()), Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        for f in &meta.files {
+            let to = output.join(&f.path);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(source.join(&f.path), to).unwrap();
+        }
+        let hash = meta.info_hash.clone();
+        let finished = |t: &Torrents| t.stats(&hash).is_ok_and(|s| s.phase == Phase::Finished);
+        authorized_storage::authorize(
+            &session,
+            &hash,
+            &output,
+            handed(meta.clone()),
+            Arc::new(|| Err(std::io::ErrorKind::PermissionDenied.into())),
+        );
+        t.add(&bytes, &output, None, Vec::new(), false)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if finished(&t) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(finished(&t), "finished from the files it was given");
+        t.stop().await;
+        authorized_storage::forget(&session, &hash);
+        // MDM starts again: nothing is checked yet, so the engine takes nothing back.
+        let mut config = offline(&state);
+        config.require_authorization = true;
+        let t = Torrents::start(config).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!t.has(&hash), "restored without anyone checking its files");
+        // The app checks them and adds it again.
+        authorized_storage::authorize(
+            &session,
+            &hash,
+            &output,
+            handed(meta.clone()),
+            Arc::new(|| Err(std::io::ErrorKind::PermissionDenied.into())),
+        );
+        t.add(&bytes, &output, None, Vec::new(), false)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if t.has(&hash) && finished(&t) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(t.has(&hash) && finished(&t), "shared again, finished");
+        for (name, byte) in [("a.bin", 3u8), ("b.bin", 5u8)] {
+            let data =
+                std::fs::read(output.join(&meta.files[0].path).with_file_name(name)).unwrap();
+            assert!(
+                data.len() == 40_000 && data.iter().all(|b| *b == byte),
+                "{name} changed"
+            );
+        }
+        t.stop().await;
+        authorized_storage::forget(&session, &hash);
+    }
+
     /// A .torrent with one 5-byte file at `folder/<name>`, written by hand (librqbit makes only
     /// valid ones).
     fn torrent_naming(name: &str) -> Vec<u8> {

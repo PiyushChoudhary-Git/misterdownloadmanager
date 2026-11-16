@@ -995,16 +995,18 @@ impl Host {
         rt.spawn(async move { t.stop().await });
     }
 
-    /// Keep sharing (true) or stop sharing (false) finished torrents: `hashes` are the list's
-    /// complete ones. Sharing starts the session if needed.
+    /// Keep sharing (true) or stop sharing (false) finished torrents: `jobs` are the list's
+    /// complete ones. Sharing starts the session if needed. A torrent the session did not
+    /// restore (the engine restores only what MDM has checked, so none at start) is checked and
+    /// added as at Start, asking nobody: one that needs a question is left for the person.
     pub fn set_sharing(
         &self,
         rt: &tokio::runtime::Handle,
         known: HashSet<String>,
-        hashes: Vec<String>,
+        jobs: Vec<ShareJob>,
         on: bool,
     ) {
-        if hashes.is_empty() || (!on && self.get().is_none()) {
+        if jobs.is_empty() || (!on && self.get().is_none()) {
             return;
         }
         let host = self.clone();
@@ -1012,14 +1014,43 @@ impl Host {
             let Ok(t) = host.session(known).await else {
                 return;
             };
-            for h in hashes {
-                let _ = if on {
-                    t.resume(&h).await
-                } else {
-                    t.remove(&h, false).await
-                };
+            for job in jobs {
+                let h = job.spec.hash.clone();
+                if !on {
+                    let _ = t.remove(&h, false).await;
+                } else if t.has(&h) {
+                    let _ = t.resume(&h).await;
+                } else if !host.busy(&h)
+                    && let Err(e) = host.share(&t, &job).await
+                {
+                    tracing::info!("torrents: {h} is not shared again: {e}");
+                }
             }
         });
+    }
+
+    async fn share(&self, t: &Arc<Torrents>, job: &ShareJob) -> Result<(), String> {
+        let mut protected = self.deletion_claims();
+        for (id, paths) in job.claims.iter() {
+            if *id != job.id {
+                protected.extend(paths.iter().cloned());
+            }
+        }
+        prepare_storage_as(self, &job.spec, &job.dest, protected, false).await?;
+        let bytes = read_kept(&job.spec.hash).await?;
+        t.add(
+            &bytes,
+            &job.spec.folder,
+            job.spec.files.clone(),
+            Vec::new(),
+            false,
+        )
+        .await
+        .map_err(|e| {
+            revoke_grant(&job.spec.hash);
+            crate::errors::torrent(&e)
+        })?;
+        Ok(())
     }
 
     /// Forget a torrent, using the saved metadata if completion or an idle session
@@ -1193,6 +1224,15 @@ async fn forget_torrent(
     .map_err(|e| e.to_string())?
 }
 
+/// A finished torrent to share again: its row, and what every row of the list claims (by row),
+/// for the check before it is added.
+pub struct ShareJob {
+    pub id: u64,
+    pub spec: TorrentSpec,
+    pub dest: PathBuf,
+    pub claims: Arc<Vec<(u64, Vec<PathBuf>)>>,
+}
+
 /// The engine may not open a torrent's files on the grant it was given for another folder or
 /// another time: used when MDM itself moves, renames or deletes them.
 pub fn revoke_grant(hash: &str) {
@@ -1217,6 +1257,18 @@ async fn prepare_storage(
     spec: &TorrentSpec,
     dest: &Path,
     protected: Vec<PathBuf>,
+) -> Result<bool, String> {
+    prepare_storage_as(host, spec, dest, protected, true).await
+}
+
+/// [`prepare_storage`]; `ask` false (nobody is there to answer: sharing at start) stops at the
+/// first file that needs a question instead of asking it.
+async fn prepare_storage_as(
+    host: &Host,
+    spec: &TorrentSpec,
+    dest: &Path,
+    protected: Vec<PathBuf>,
+    ask: bool,
 ) -> Result<bool, String> {
     if let Some(owner) = &spec.ownership {
         host.ownership_ready(owner).await?;
@@ -1304,6 +1356,12 @@ async fn prepare_storage(
             Err(error) => {
                 let files =
                     crate::torrent_ownership::take_consent(error).map_err(|e| e.to_string())?;
+                if !ask {
+                    return Err(crate::i18n::t(
+                        // i18n: the user refused write permission for existing files when starting a torrent
+                        "The torrent was not started because permission to use existing files was declined.",
+                    ).to_owned());
+                }
                 let mut text = crate::i18n::t(
                     // i18n: question before starting/resuming a torrent that would modify files without a matching ownership/consent record; Yes authorizes writes, No leaves files unchanged
                     "These files have no matching ownership or consent record. Starting the torrent can resize them and replace their contents, including unticked files that share pieces. Use these files?",
