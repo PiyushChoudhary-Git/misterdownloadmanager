@@ -144,17 +144,19 @@ fn fold_case(path: PathBuf) -> PathBuf {
 /// out again. The names are checked before; this is what the system actually opened.
 fn open_inside(path: &Path, create: bool, expected: &Path) -> io::Result<std::fs::File> {
     let file = open_torrent_file(path, create)?;
+    // What this made is taken out again where the handle really is: the name may lead
+    // elsewhere by now (a link put back), so removing it by name would miss it.
+    let refuse = |file: &std::fs::File, real: Option<&Path>, e: io::Error| {
+        if create && let Ok(id) = identity(file) {
+            let _ = remove_owned_torrent_file(real.unwrap_or(path), id);
+        }
+        e
+    };
     let outside = || {
         io::Error::other(crate::i18n::t(
             // i18n: a torrent's folder is a link or junction leading outside its destination
             "A torrent file's folder points outside its destination",
         ))
-    };
-    let refuse = |file: &std::fs::File, e: io::Error| {
-        if create && let Ok(id) = identity(file) {
-            let _ = remove_owned_torrent_file(path, id);
-        }
-        e
     };
     match torrent_file_path(&file) {
         Ok(real)
@@ -164,10 +166,10 @@ fn open_inside(path: &Path, create: bool, expected: &Path) -> io::Result<std::fs
         {
             Ok(file)
         }
-        Ok(_) => Err(refuse(&file, outside())),
+        Ok(real) => Err(refuse(&file, Some(&real), outside())),
         // A system that can't say where a handle is keeps the checks before the open.
         Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(file),
-        Err(e) => Err(refuse(&file, e)),
+        Err(e) => Err(refuse(&file, None, e)),
     }
 }
 
@@ -1891,5 +1893,160 @@ mod tests {
         assert!(open_inside(&root.join("f.bin"), false, &expected).is_err());
         assert!(open_inside(&root.join("f.bin"), true, &expected).is_err());
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"mine");
+    }
+
+    /// Save to is itself a link to another place (a junction to another drive, a symlinked
+    /// Documents): the torrent starts, writes where the link leads, and is deleted again.
+    #[test]
+    fn direct_a_save_to_that_is_a_link_works_and_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = tmp.path().join("linked");
+        link_dir(&real, &linked);
+        let root = linked.join("Set");
+        let own = owner(&["a.bin", "d/b.bin", "d/e/c.bin"]);
+        own.initialize(tmp.path(), &root, &root, &[]).unwrap();
+        let held = own.prepare(tmp.path(), &root, &root).unwrap();
+        assert_eq!(held.len(), 3);
+        assert!(real.join("Set/d/e/c.bin").is_file());
+        drop(held);
+        // A second start with the objects it made recorded: no question.
+        drop(own.prepare(tmp.path(), &root, &root).unwrap());
+        let kept = own.delete(tmp.path(), &root, &root, false, &[]).unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(!real.join("Set/a.bin").exists());
+    }
+
+    /// The folder written differently from how the system names it (case on Windows and
+    /// macOS, a trailing separator, `.` and `..` parts) is still the same folder.
+    #[test]
+    fn direct_a_folder_named_another_way_is_not_taken_for_a_different_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        std::fs::create_dir_all(root.join("Sub")).unwrap();
+        let odd = tmp.path().join("x").join("..").join("Set");
+        std::fs::create_dir_all(tmp.path().join("x")).unwrap();
+        let own = owner(&["Sub/a.bin", "Sub/b.bin"]);
+        own.initialize(tmp.path(), &odd, &odd, &[]).unwrap();
+        assert_eq!(own.prepare(tmp.path(), &odd, &odd).unwrap().len(), 2);
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let upper = PathBuf::from(root.to_string_lossy().to_uppercase());
+            let own = owner(&["Sub/c.bin", "Sub/d.bin"]);
+            own.initialize(tmp.path(), &upper, &upper, &[]).unwrap();
+            assert_eq!(own.prepare(tmp.path(), &upper, &upper).unwrap().len(), 2);
+            assert!(root.join("Sub/c.bin").is_file());
+        }
+    }
+
+    /// Another program swaps a folder for a link and back as fast as it can while files are
+    /// made in it: whatever is made is where it was asked for, and what could not be made
+    /// there is not left anywhere.
+    #[test]
+    fn direct_a_folder_flipping_between_real_and_link_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        let sub = root.join("sub");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let lnk = root.join("lnk");
+        link_dir(&outside, &lnk);
+        let parked = root.join("parked");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let (stop, sub, lnk, parked) = (stop.clone(), sub.clone(), lnk.clone(), parked.clone());
+            std::thread::spawn(move || {
+                let mut flips = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // The real folder out of the way and the link in its place, then back.
+                    if std::fs::rename(&sub, &parked).is_ok() {
+                        if std::fs::rename(&lnk, &sub).is_ok() {
+                            flips += 1;
+                            std::thread::sleep(std::time::Duration::from_micros(300));
+                            let _ = std::fs::rename(&sub, &lnk);
+                        }
+                        let _ = std::fs::rename(&parked, &sub);
+                    }
+                }
+                flips
+            })
+        };
+        let mut refused = 0;
+        let mut kinds: std::collections::BTreeMap<String, u32> = Default::default();
+        let mut made = std::collections::BTreeSet::new();
+        for i in 0..150 {
+            let file = sub.join(format!("f{i}.bin"));
+            let mut homes = HashMap::new();
+            let expected = expected_path(&mut homes, &file);
+            match open_inside(&file, true, &expected) {
+                Ok(f) => {
+                    made.insert(format!("f{i}.bin"));
+                    // open_inside has just checked where it is; asking again here would see
+                    // a folder that has been flipped since.
+                    drop(f);
+                }
+                Err(e) => {
+                    refused += 1;
+                    *kinds.entry(format!("{:?}", e.kind())).or_insert(0) += 1;
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let flips = flipper.join().unwrap();
+        // Nothing made while the folder was not the one asked for is left in the other place.
+        let left: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        eprintln!(
+            "{flips} flips; refused {refused} of 150 {kinds:?}, {} files in outside",
+            left.len()
+        );
+        // A file in `outside` is allowed only when it was made and kept as asked: the link was
+        // in place when its folder was resolved. Any other was made through the link after the
+        // check and not taken out again.
+        let leaked: Vec<_> = left
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !made.contains(n))
+            .collect();
+        assert!(leaked.is_empty(), "leaked through the link: {leaked:?}");
+    }
+
+    /// A delete and a start of the same torrent on two threads must neither deadlock nor
+    /// lose the record.
+    #[test]
+    fn direct_a_start_and_a_delete_on_two_threads_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        std::fs::create_dir_all(&root).unwrap();
+        let names: Vec<String> = (0..200).map(|i| format!("d{}/f{i}.bin", i % 5)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let own = std::sync::Arc::new(owner(&refs));
+        own.initialize(tmp.path(), &root, &root, &[]).unwrap();
+        drop(own.prepare(tmp.path(), &root, &root).unwrap());
+        let data = tmp.path().to_owned();
+        let threads: Vec<_> = (0..4)
+            .map(|n| {
+                let (own, data, root) = (own.clone(), data.clone(), root.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        if n % 2 == 0 {
+                            let _ = own.prepare(&data, &root, &root);
+                        } else {
+                            let _ = own.delete(&data, &root, &root, false, &[]);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Whatever order they ran in, one more delete leaves nothing of the torrent.
+        let kept = own.delete(tmp.path(), &root, &root, false, &[]).unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
     }
 }
