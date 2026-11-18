@@ -86,13 +86,13 @@ struct Receipt {
 
 #[cfg(unix)]
 use crate::unix::{
-    remove_owned_torrent_file, torrent_file_identity as identity,
-    torrent_file_identity_at as identity_at,
+    open_torrent_file, remove_owned_torrent_file, torrent_file_identity as identity,
+    torrent_file_identity_at as identity_at, torrent_file_path,
 };
 #[cfg(windows)]
 use crate::win32::{
-    remove_owned_torrent_file, torrent_file_identity as identity,
-    torrent_file_identity_at as identity_at,
+    open_torrent_file, remove_owned_torrent_file, torrent_file_identity as identity,
+    torrent_file_identity_at as identity_at, torrent_file_path,
 };
 
 /// Resolve existing ancestors too, so aliases and case differences cannot evade a claim.
@@ -112,11 +112,63 @@ pub fn key(path: &Path) -> PathBuf {
     for name in tail.into_iter().rev() {
         resolved.push(name);
     }
+    fold_case(resolved)
+}
+
+/// The folder `path` should really be in, resolved (once per folder). The name is not
+/// compared: a link as the name is refused when opening, and some systems store names in
+/// another Unicode form than the one asked for.
+fn expected_path(homes: &mut HashMap<PathBuf, PathBuf>, path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(path);
+    homes
+        .entry(parent.to_owned())
+        .or_insert_with(|| key(parent))
+        .clone()
+}
+
+/// Case-insensitive systems compare paths in lower case.
+fn fold_case(path: PathBuf) -> PathBuf {
     #[cfg(any(windows, target_os = "macos"))]
     {
-        resolved = PathBuf::from(resolved.to_string_lossy().to_lowercase());
+        PathBuf::from(path.to_string_lossy().to_lowercase())
     }
-    resolved
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        path
+    }
+}
+
+/// Open or make the file at `path` without following a link, and check the handle itself is
+/// where `expected` says (the folder it is in, resolved before): a folder swapped
+/// for a junction or a link after the checks leads elsewhere, and what this made there is taken
+/// out again. The names are checked before; this is what the system actually opened.
+fn open_inside(path: &Path, create: bool, expected: &Path) -> io::Result<std::fs::File> {
+    let file = open_torrent_file(path, create)?;
+    let outside = || {
+        io::Error::other(crate::i18n::t(
+            // i18n: a torrent's folder is a link or junction leading outside its destination
+            "A torrent file's folder points outside its destination",
+        ))
+    };
+    let refuse = |file: &std::fs::File, e: io::Error| {
+        if create && let Ok(id) = identity(file) {
+            let _ = remove_owned_torrent_file(path, id);
+        }
+        e
+    };
+    match torrent_file_path(&file) {
+        Ok(real)
+            if real
+                .parent()
+                .is_some_and(|p| fold_case(p.to_owned()) == expected) =>
+        {
+            Ok(file)
+        }
+        Ok(_) => Err(refuse(&file, outside())),
+        // A system that can't say where a handle is keeps the checks before the open.
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(file),
+        Err(e) => Err(refuse(&file, e)),
+    }
 }
 
 fn claimed(set: &BTreeSet<PathBuf>, path: &Path) -> bool {
@@ -295,11 +347,27 @@ impl Ownership {
             .collect()
     }
 
+    /// One lock per torrent for everything that reads and writes its record: a start, a move, a
+    /// delete and a forget on different threads must not interleave their read, change and
+    /// write, or one writes over the other.
+    fn lock(&self) -> std::sync::Arc<Mutex<()>> {
+        static LOCKS: std::sync::LazyLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> =
+            std::sync::LazyLock::new(Default::default);
+        LOCKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(self.token.clone())
+            .or_default()
+            .clone()
+    }
+
     fn ledger_path(&self, data: &Path) -> PathBuf {
         data.join("ownership").join(format!("{}.json", self.token))
     }
 
     pub fn forget(&self, data: &Path) -> io::Result<()> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         self.check_token()?;
         match std::fs::remove_file(self.ledger_path(data)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -314,6 +382,8 @@ impl Ownership {
         dest: &Path,
         existing: &[Consent],
     ) -> io::Result<()> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let paths = self.paths(folder, dest);
         let mut protected = Vec::new();
         let mut consented = Vec::new();
@@ -356,6 +426,8 @@ impl Ownership {
     /// was, by name). Without it, resuming a half-downloaded torrent or sharing a finished one
     /// after an update would ask about MDM's own files. A record that exists is left alone.
     pub fn adopt_existing(&self, data: &Path, folder: &Path, dest: &Path) -> io::Result<()> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         self.check_token()?;
         if self.ledger_path(data).exists() {
             return Ok(());
@@ -465,6 +537,8 @@ impl Ownership {
         dest: &Path,
         fresh: Vec<mdm_torrent::authorized_storage::PreparedFile>,
     ) -> io::Result<Vec<mdm_torrent::authorized_storage::PreparedFile>> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         use mdm_torrent::authorized_storage::PreparedFile;
         use std::collections::{HashMap, HashSet};
         let mut ledger = self.load(data)?;
@@ -482,6 +556,8 @@ impl Ownership {
         let mut new_directories: Vec<Receipt> = Vec::new();
         // Files whose earlier receipts a fresh agreement or a new object replaces.
         let mut reset: HashSet<usize> = HashSet::new();
+        // Where each folder really is, found once, before its files are opened.
+        let mut homes: HashMap<PathBuf, PathBuf> = HashMap::new();
         let result = (|| {
             let mut paths = Vec::new();
             // Validate every path before opening or allocating anything, even unticked and
@@ -538,10 +614,8 @@ impl Ownership {
                         }
                         // Open without create/truncate/set_len, then identify this handle.
                         // A name replacement before open cannot borrow the old object's grant.
-                        let file = std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(&path)?;
+                        let expected = expected_path(&mut homes, &path);
+                        let file = open_inside(&path, false, &expected)?;
                         let id = identity(&file).ok();
                         let allowed = id.is_some_and(|id| {
                             owned.get(&claim.index).is_some_and(|ids| ids.contains(&id))
@@ -574,12 +648,8 @@ impl Ownership {
                     return Err(io::ErrorKind::PermissionDenied.into());
                 }
                 Self::mkdirs(folder, path.parent().unwrap(), &mut new_directories)?;
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                {
+                let expected = expected_path(&mut homes, &path);
+                match open_inside(&path, true, &expected) {
                     Ok(file) => {
                         match identity(&file) {
                             Ok(id) => {
@@ -607,17 +677,8 @@ impl Ownership {
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                         // Whatever won the race must be a plain file, not a link that
-                        // appeared meanwhile.
-                        if !path
-                            .symlink_metadata()
-                            .is_ok_and(|m| m.file_type().is_file())
-                        {
-                            return Err(io::ErrorKind::InvalidInput.into());
-                        }
-                        let file = std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(&path)?;
+                        // appeared meanwhile: it is opened without following one.
+                        let file = open_inside(&path, false, &expected)?;
                         return Err(consent_error(vec![PreparedFile {
                             index: claim.index,
                             path,
@@ -683,8 +744,15 @@ impl Ownership {
 
     /// Before MDM moves the files itself: which of them are still the objects it made or the
     /// person agreed to use (their identity matches the record). Only those may be re-recorded
-    /// afterwards ([`Self::rebind`]): a file someone put in their place is not.
-    pub fn verified(&self, data: &Path, folder: &Path, dest: &Path) -> io::Result<Vec<usize>> {
+    /// afterwards ([`Self::rebind`]): a file someone put in their place is not. Each comes with
+    /// its length, which a move keeps, so that a different file put there between the check and
+    /// the move is told apart afterwards.
+    pub fn verified(
+        &self,
+        data: &Path,
+        folder: &Path,
+        dest: &Path,
+    ) -> io::Result<Vec<(usize, u64)>> {
         let ledger = self.load(data)?;
         let mut recorded: HashMap<usize, Vec<Identity>> = HashMap::new();
         for r in ledger.files.iter().chain(&ledger.consented) {
@@ -695,12 +763,11 @@ impl Ownership {
             let Some(ids) = recorded.get(&claim.index) else {
                 continue;
             };
-            if path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_file())
+            if let Ok(metadata) = path.symlink_metadata()
+                && metadata.file_type().is_file()
                 && identity_at(&path).is_ok_and(|id| ids.contains(&id))
             {
-                ours.push(claim.index);
+                ours.push((claim.index, metadata.len()));
             }
         }
         Ok(ours)
@@ -712,19 +779,24 @@ impl Ownership {
     pub fn rebind(
         &self,
         data: &Path,
-        verified: &[usize],
+        verified: &[(usize, u64)],
         folder: &Path,
         dest: &Path,
     ) -> io::Result<()> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut ledger = self.load(data)?;
         let mut changed = false;
-        let verified: HashSet<usize> = verified.iter().copied().collect();
+        let verified: HashMap<usize, u64> = verified.iter().copied().collect();
         let mut now: HashMap<usize, Identity> = HashMap::new();
         for (claim, path) in self.files.iter().zip(self.paths(folder, dest)) {
-            if !verified.contains(&claim.index)
-                || !path
-                    .symlink_metadata()
-                    .is_ok_and(|m| m.file_type().is_file())
+            let Some(length) = verified.get(&claim.index) else {
+                continue;
+            };
+            // Still a plain file of the length it had: not a link or another file put there.
+            if !path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_file() && m.len() == *length)
             {
                 continue;
             }
@@ -758,6 +830,8 @@ impl Ownership {
         keep_root: bool,
         protected: &[PathBuf],
     ) -> io::Result<Vec<PathBuf>> {
+        let lock = self.lock();
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let ledger = self.load(data)?;
         // Other downloads' files on another drive can't be this torrent's: leave their drives
         // asleep.
@@ -1133,7 +1207,7 @@ mod tests {
         own.prepare(tmp.path(), &root, &there).unwrap();
         std::fs::write(&there, b"the finished download").unwrap();
         let ours = own.verified(tmp.path(), &root, &there).unwrap();
-        assert_eq!(ours, vec![0]);
+        assert_eq!(ours.iter().map(|o| o.0).collect::<Vec<_>>(), vec![0]);
         // Move to another drive: a copy, then the original deleted. A new object.
         let moved = tmp.path().join("elsewhere");
         std::fs::create_dir(&moved).unwrap();
@@ -1165,7 +1239,11 @@ mod tests {
         std::fs::rename(root.join("a.bin"), tmp.path().join("original")).unwrap();
         std::fs::write(root.join("a.bin"), b"the person's").unwrap();
         let ours = own.verified(tmp.path(), &root, &root).unwrap();
-        assert_eq!(ours, vec![1], "only the file that is still MDM's");
+        assert_eq!(
+            ours.iter().map(|o| o.0).collect::<Vec<_>>(),
+            vec![1],
+            "only the file that is still MDM's"
+        );
         own.rebind(tmp.path(), &ours, &root, &root).unwrap();
         own.delete(tmp.path(), &root, &root, true, &[]).unwrap();
         assert!(root.join("a.bin").exists(), "the person's file stays");
@@ -1754,5 +1832,64 @@ mod tests {
         drop(held);
         // Every file and the folders MDM made went; the folder the person made stays, empty.
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    /// A folder link (a junction on Windows) from `link` to `target`.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+    }
+
+    /// The folders are checked first, then the file is made: a folder swapped for a link in
+    /// between must not let the file be made outside the destination.
+    #[test]
+    fn direct_a_folder_swapped_for_a_link_after_the_check_gets_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        let sub = root.join("sub");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut homes = HashMap::new();
+        let file = sub.join("f.bin");
+        let expected = expected_path(&mut homes, &file);
+        std::fs::remove_dir(&sub).unwrap();
+        link_dir(&outside, &sub);
+        let refused = open_inside(&file, true, &expected);
+        assert!(refused.is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        // The same folder, unswapped, is fine.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let expected = expected_path(&mut homes, &plain.join("g.bin"));
+        assert!(open_inside(&plain.join("g.bin"), true, &expected).is_ok());
+    }
+
+    /// A link as the file's own name is never opened through, whether it is there already or
+    /// appears between the check and the open.
+    #[cfg(unix)]
+    #[test]
+    fn direct_a_link_at_the_file_name_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        std::fs::create_dir_all(&root).unwrap();
+        let elsewhere = tmp.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, b"mine").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("f.bin")).unwrap();
+        let mut homes = HashMap::new();
+        let expected = expected_path(&mut homes, &root.join("f.bin"));
+        assert!(open_inside(&root.join("f.bin"), false, &expected).is_err());
+        assert!(open_inside(&root.join("f.bin"), true, &expected).is_err());
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"mine");
     }
 }

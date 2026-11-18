@@ -98,6 +98,55 @@ pub fn torrent_file_identity_at(path: &std::path::Path) -> std::io::Result<[u64;
     torrent_file_identity(&file)
 }
 
+/// Open (or, with `create`, make with `create_new`) the file at `path` for the torrent engine
+/// without following a link at its end: `FILE_FLAG_OPEN_REPARSE_POINT` opens a symbolic link
+/// itself, not what it points to, and one is refused. A folder is refused too.
+pub fn open_torrent_file(path: &std::path::Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    if create {
+        options.create_new(true);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        || (attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && metadata.file_type().is_symlink())
+    {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    Ok(file)
+}
+
+/// Where the opened object really is: the system's final path of the handle, links resolved.
+pub fn torrent_file_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let handle = file.as_raw_handle();
+    let mut buffer = vec![0u16; 1024];
+    loop {
+        // SAFETY: the live handle and a buffer of the length given.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buffer.len() {
+            buffer.truncate(n);
+            return Ok(std::ffi::OsString::from_wide(&buffer).into());
+        }
+        buffer.resize(n + 1, 0);
+    }
+}
+
 /// Delete the verified object through its handle, even if the path is replaced. The handle is
 /// opened sharing read, write and delete, so a program that has the file open (the torrent
 /// engine on its way out, an antivirus scanning a file just made, the indexer) does not stop it,
