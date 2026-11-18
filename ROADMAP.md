@@ -564,6 +564,9 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ Malay: 24 menu and column items reviewed by a native speaker (torrent columns, Linux display
+  systems, text rendering and graphics notes) (thanks to [@9M2PJU](https://github.com/9M2PJU))
+
 - ✅ Torrents connect over uTP (BitTorrent over UDP) beside TCP, on by default with a switch in
   Torrent settings: peers that take only uTP are reached, so torrents find as many peers as in
   other clients; off with a SOCKS5 proxy, held to a chosen network adapter
@@ -705,6 +708,8 @@ These ship in the next version.
   start for a window slow just after signing in; View → Draw with says since when and until when
   ([#1205](https://github.com/anefzaoui/misterdownloadmanager/issues/1205))
 - ✅ The guide's links to **Click'n'Load** and **Proxy / Socks** land on their sections (thanks to [@Seyamalam](https://github.com/Seyamalam))
+- ✅ The termbases reach the newest machine rows too — Arabic's browser is the مستعرض and
+  Bangla's details are বিস্তারিত (thanks to [@Seyamalam](https://github.com/Seyamalam))
 - ✅ macOS: no more **The window stopped responding** report while a file dialog is open: the
   time its window thread spends in a system Open or Save dialog isn't counted
   ([#1192](https://github.com/anefzaoui/misterdownloadmanager/issues/1192))
