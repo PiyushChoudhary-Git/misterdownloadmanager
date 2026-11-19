@@ -260,6 +260,10 @@
 #. {name} = a file name (keep the braces as they are)
 #, machine
 	A file of this torrent can't be saved safely: {name}	Eine Datei dieses Torrents kann nicht sicher gespeichert werden: {name}
+#. text in a dialog box
+#. the question about a name typed in Save As, above the file's path; the choices are the duplicate question's (numbered name, overwrite)
+#, machine
+	A file with this name is already there:	Eine Datei mit diesem Namen ist bereits vorhanden:
 #. message or event log entry in the main window
 #. Link grabber added a magnet link whose torrent could not be found; {error} says why
 #. {error} = an error message (keep the braces as they are)
@@ -1864,6 +1868,10 @@
 #. noun: a file of no known type
 #, machine
 	File	Datei
+#. text in a dialog box
+#. window title: the question asked when the name typed in Download File Info's Save As is a file already there
+#, machine
+	File already exists	Datei ist bereits vorhanden
 #. text in the Options window
 #. tooltip of "Mark downloaded files as coming from the internet" on Linux
 #, machine
@@ -3026,6 +3034,14 @@
 #. a country's name (where a download's server is)
 #, machine
 	Morocco	Marokko
+#. text in playlistdlg.rs
+#. a quality in Download video for a whole playlist: each video's best H.264 video with AAC sound, an MP4 that every video editor, TV and phone plays; keep "(H.264 + AAC)" as it is
+#, machine
+	Most compatible (H.264 + AAC)	Am kompatibelsten (H.264 + AAC)
+#. text in the Download video window
+#. a choice in the Download video window: the best H.264 video with AAC sound, an MP4 that every video editor, TV and phone plays; keep "(H.264 + AAC)" as it is; {height} is the resolution (1080p)
+#, machine
+	Most compatible (H.264 + AAC) · {height}	Am kompatibelsten (H.264 + AAC) · {height}
 #. button in a download's Properties window
 #. verb: move the file to another folder
 #, machine
@@ -3871,6 +3887,11 @@
 #. {error} = an error message (keep the braces as they are)
 #, machine
 	Recheck failed: {error}	Erneute Überprüfung fehlgeschlagen: {error}
+#. text in a download's progress window
+#. a live stream's status: yt-dlp records it (it shows no progress, only the size so far)
+#. the trailing ... means it is still going on: keep it
+#, machine
+	Recording...	Aufnahme...
 #. message or event log entry in the main window
 #. window title, verb: download the file again from the start
 #, machine
@@ -4082,6 +4103,11 @@
 #. label before the folder the torrent is saved in
 #, machine
 	Saved in	Gespeichert in
+#. text in a download's progress window
+#. a live stream's status: stopped, and what was recorded being made into the video file kept
+#. the trailing ... means it is still going on: keep it
+#, machine
+	Saving...	Speichern...
 #. tab in the Scheduler window
 #. noun: tab title; when the queue starts and stops
 #, machine
@@ -4580,6 +4606,10 @@
 #. remote control page (on a phone): button: stop a queue
 #, machine
 	Stop	Anhalten
+#. text in a download's progress window
+#. button in a live stream's progress window: stop recording it and keep what was recorded as a video file
+#, machine
+	Stop and save	Stoppen und speichern
 #. text in the Scheduler window; checkbox in the Scheduler window
 #, machine
 	Stop download at	Download beenden um
@@ -5685,6 +5715,10 @@
 #. Video helpers: button: go back to the copy MDM downloads and checks itself
 #, machine
 	Use MDM's own copy	Eigene Kopie von MDM verwenden
+#. checkbox in the Options window
+#. Options → Sites Logins: checkbox under Cookies for video sites: yt-dlp also reads the person's own yt-dlp config file
+#, machine
+	Use my yt-dlp config file	Meine yt-dlp-Konfigurationsdatei verwenden
 #. text in the Batch download window
 #. why Batch download's OK is greyed
 #, machine
@@ -6022,6 +6056,10 @@
 #. in Download video and the browser's video menu: yt-dlp had no JavaScript runtime, so YouTube listed only some qualities (often only the sound); Node.js and Deno are program names
 #, machine
 	YouTube needs a JavaScript runtime to list its video qualities: install Node.js or Deno, then look it up again	YouTube benötigt eine JavaScript-Laufzeitumgebung, um Videoqualitäten aufzulisten. Installieren Sie Node.js oder Deno und suchen Sie dann erneut.
+#. text in the Options window
+#. Options → Sites Logins → Use my yt-dlp config file: its tooltip
+#, machine
+	yt-dlp also reads its own config files (on Windows %APPDATA%\\yt-dlp\\config.txt, on Linux and macOS ~/.config/yt-dlp/config). Most of what MDM chooses, the folder, the name and the quality, still wins, but options there that skip or filter videos apply too.	yt-dlp liest zusätzlich seine eigenen Konfigurationsdateien (unter Windows %APPDATA%\\yt-dlp\\config.txt, unter Linux und macOS ~/.config/yt-dlp/config). Das meiste, was MDM festlegt (Ordner, Name und Qualität), hat weiterhin Vorrang, aber Optionen darin, die Videos überspringen oder filtern, gelten ebenfalls.
 #. text in the Download video window
 #. the Download video window: yt-dlp couldn't read the cookies of the browser chosen in Options (Chrome, Edge...), which holds them while it runs; {browser} = its name
 #, machine
@@ -6696,6 +6734,10 @@ extension	Mister Download Manager then downloads through the same proxy as this 
 #. the small arrow next to the Download video button that opens its menu (read aloud by screen readers)
 #, machine
 extension	More options	Weitere Optionen
+#. text in the browser extension
+#. in the list under the download button over a video, after a quality's height (1080p): the H.264 video with AAC sound in an MP4, the file that plays in every video editor, TV and phone; short, about 20 characters at most
+#, machine
+extension	Most compatible	Am kompatibelsten
 #. text in the browser extension
 #. menu command of the download button over a video: never show the button on this web site again
 #. {site} = a web site's name such as "example.com" (keep the braces as they are)

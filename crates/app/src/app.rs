@@ -628,6 +628,41 @@ fn stop_all_plan(
     (running, ids)
 }
 
+/// Why MDM stops a running download by itself, to start it again later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoStop {
+    /// The network adapter changed or went away (#35).
+    Adapter,
+    /// The download limit was reached (Scheduler).
+    Quota,
+    /// A new speed limit for a helper program, taken only as it starts (#708).
+    SpeedLimit,
+}
+
+/// MDM's own stop (`why`) leaves this download running: a live stream's recording being saved
+/// (a stop does nothing to it, and a start after a save that failed would record over what is
+/// left of it), and, for a new speed limit, a live stream being recorded (starting it again would
+/// end its recording: the limit applies from its next start). A network adapter change still
+/// restarts a recording (its next start sets the recording so far aside).
+fn auto_stop_spares(why: AutoStop, live: Option<mdm_tools::video::LiveState>) -> bool {
+    use mdm_tools::video::LiveState;
+    match live {
+        Some(LiveState::Saving) => true,
+        Some(LiveState::Recording) => why == AutoStop::SpeedLimit,
+        None => false,
+    }
+}
+
+/// `halt`'s stop began to save a live stream's recording: it was recording as it was stopped
+/// (`before`), or is being saved now (`after`: its recording had begun in between).
+fn halt_saved(
+    before: Option<mdm_tools::video::LiveState>,
+    after: Option<mdm_tools::video::LiveState>,
+) -> bool {
+    use mdm_tools::video::LiveState;
+    before == Some(LiveState::Recording) || after == Some(LiveState::Saving)
+}
+
 /// A file move's answer, from its thread.
 type MoveDone = std::sync::mpsc::Receiver<Result<(), String>>;
 
@@ -1579,6 +1614,12 @@ pub struct App {
     /// Stopped by hand while they could have run: a running queue leaves them alone until
     /// they are started again or the queue is started anew (#341).
     stopped_by_hand: std::collections::HashSet<u64>,
+    /// Live streams whose recording a stop (`halt`: by hand, Stop All, a queue's stop, the
+    /// Scheduler's) began to save: one whose saving failed is never started again by a queue,
+    /// even one started anew (a start would record over what is left of it), only by the user's
+    /// own start of it. Memory only: after a restart MDM's next start of it sets the recording
+    /// aside (never over it).
+    saved_by_hand: std::collections::HashSet<u64>,
     /// Seconds since local midnight at the last scheduler tick (`None` until the clock's first
     /// answer, #536).
     clock: Option<u32>,
@@ -2221,6 +2262,7 @@ impl App {
             queues,
             failures: HashMap::new(),
             stopped_by_hand: Default::default(),
+            saved_by_hand: Default::default(),
             clock: None,
             wake: Default::default(),
             commands,
@@ -2944,7 +2986,9 @@ impl App {
         };
         let mut stopped = Vec::new();
         for i in &mut self.items {
-            if let Some(l) = &i.live {
+            if let Some(l) = &i.live
+                && !auto_stop_spares(AutoStop::Adapter, l.dl.live_state())
+            {
                 l.dl.cancel();
                 i.note(note.clone());
                 stopped.push(i.id);
@@ -3265,7 +3309,7 @@ impl App {
                     v.show_sample_adaptive(tab == "runtime");
                 }
             }
-            // A sample playlist (#69), its quality by its place in the list: `video-playlist:7`.
+            // A sample playlist (#69), its quality by its place in the list: `video-playlist:8`.
             "video-playlist" => {
                 self.run(Cmd::VideoPage, None, ctx);
                 if let Some(v) = &mut self.video_dlg {
@@ -3752,6 +3796,15 @@ impl App {
                 (_, None) => Some(mdm_engine::agent::IE11_USER_AGENT.to_owned()),
                 (false, Some(_)) => None,
             },
+            // A site whose bot check refuses the browser's User-Agent and the browser-like
+            // connection too (#1422, SourceForge's): asked once more under MDM's own name, or
+            // the one set in Options when a browser handed the download over. Again, one the
+            // user set for every download is the user's choice: no other.
+            own_agent: match (context.user_agent.is_some(), own) {
+                (true, Some(own)) => Some(own.to_owned()),
+                (_, None) => Some(mdm_engine::agent::OWN_USER_AGENT.to_owned()),
+                (false, Some(_)) => None,
+            },
             // Where the browser's own download of it ended: asked when the link itself is
             // refused (#630, a one-time or session-bound token the browser already used).
             browser_final: context
@@ -3961,6 +4014,8 @@ impl App {
     fn start(&mut self, id: u64, show: bool) {
         let show = show && self.settings.show_progress;
         self.stopped_by_hand.remove(&id);
+        // Queues never start one whose saving failed (`member_of`): this is the user's start.
+        self.saved_by_hand.remove(&id);
         let rt = self.rt.clone();
         let Some(item) = self.item(id) else { return };
         // A finished gallery may start again: it fetches the files not there yet (#58).
@@ -4197,6 +4252,9 @@ impl App {
             if let Some(i) = self.items.iter_mut().find(|i| i.id == id)
                 && let Some(l) = &i.live
             {
+                if auto_stop_spares(AutoStop::SpeedLimit, l.dl.live_state()) {
+                    continue;
+                }
                 l.dl.cancel();
                 i.note(
                     // i18n: event log entry: a video or gallery download stopped to start again at the new speed limit (its helper program takes a limit only as it starts)
@@ -4244,9 +4302,21 @@ impl App {
     }
 
     /// Stop, and not start again by itself for a network adapter, a speed limit or the
-    /// download limit (#1164): the user's Stop, Stop All and a queue's stop.
+    /// download limit (#1164): the user's Stop, Stop All and a queue's stop. A live stream being
+    /// recorded is stopped and saved (`Job::save`): what it recorded is kept as a video, the
+    /// download then done, as one that ended by itself. Cancel (`stop`) and MDM's own stops
+    /// kill it as before (a later start sets its recording aside, never over it).
     fn halt(&mut self, id: u64) {
-        self.stop(id);
+        // A video waiting for its place doesn't start.
+        self.video_places.unwait(id);
+        // Every other download stops here as `stop` stops it.
+        if let Some(l) = self.item(id).and_then(|i| i.live.as_ref()) {
+            let before = l.dl.live_state();
+            l.dl.save();
+            if halt_saved(before, l.dl.live_state()) {
+                self.saved_by_hand.insert(id);
+            }
+        }
         self.adapter_paused.retain(|x| *x != id);
         self.limit_restarts.retain(|x| *x != id);
         if let Some(at) = self.quota.held.iter().position(|x| *x == id) {
@@ -6976,13 +7046,17 @@ impl App {
     }
 
     /// Batch download → OK: every address goes to the main download queue (IDM's default; its
-    /// queue selection panel is not built yet).
+    /// queue selection panel is not built yet), into Save to's folder if one was given, else
+    /// each into its category's folder.
     fn add_batch(&mut self, added: crate::batch::Added) {
         let mut ids = Vec::new();
         for url in added.urls {
             let name = mdm_engine::naming::file_name(None, &url);
             let category = Category::of(&name);
-            let dir = self.settings.category_dir(category, &self.downloads);
+            let dir = match &added.folder {
+                Some(folder) => folder.clone(),
+                None => self.settings.category_dir(category, &self.downloads),
+            };
             // Numbered on as it starts if the name is taken then (#743): no disk here.
             let dest = mdm_engine::naming::guess(&dir, &name);
             let id = self.push_item(
@@ -7617,6 +7691,9 @@ impl App {
         }
         match i.status {
             Status::Stopped if self.stopped_by_hand.contains(&id) => Member::Held,
+            // A live stream a stop began to save, whose saving failed (its recording left as it
+            // was): stopped by the user, not failed; a retry would record over it.
+            Status::Error if self.saved_by_hand.contains(&id) => Member::Held,
             Status::Queued | Status::Stopped => Member::Waiting,
             Status::Downloading => Member::Running,
             Status::Complete => Member::Complete,
@@ -7701,7 +7778,9 @@ impl App {
                 let running: Vec<u64> = self
                     .items
                     .iter()
-                    .filter(|i| i.live.is_some())
+                    .filter(|i| {
+                        i.live.is_some() && !auto_stop_spares(AutoStop::Quota, i.live_state())
+                    })
                     .map(|i| i.id)
                     .collect();
                 for id in running {
@@ -14116,6 +14195,73 @@ mod duplicate_tests {
 }
 
 #[cfg(test)]
+mod add_batch_tests {
+    use super::*;
+
+    fn app() -> std::mem::ManuallyDrop<App> {
+        let rt = Box::leak(Box::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ));
+        let loaded = store::Loaded {
+            next_id: 1,
+            items: Vec::new(),
+            columns: None,
+            settings: Settings::default(),
+            queues: Vec::new(),
+        };
+        let (_, commands) = std::sync::mpsc::channel();
+        std::mem::ManuallyDrop::new(App::assemble(
+            &egui::Context::default(),
+            rt.handle().clone(),
+            commands,
+            loaded,
+            crate::Start::Shown,
+        ))
+    }
+
+    fn added(folder: Option<&std::path::Path>) -> crate::batch::Added {
+        crate::batch::Added {
+            urls: [
+                "http://127.0.0.1:9/img01.jpg",
+                "http://127.0.0.1:9/part02.zip",
+            ]
+            .map(|u| url::Url::parse(u).unwrap())
+            .to_vec(),
+            login: None,
+            folder: folder.map(Into::into),
+        }
+    }
+
+    /// #1403: Batch download's OK without a folder puts each file in its category's folder, as
+    /// before; with one (Save to), every file of the batch goes there, named as before.
+    #[test]
+    fn a_batch_goes_to_its_folder_or_each_files_category_folder() {
+        let mut each = app();
+        each.add_batch(added(None));
+        assert_eq!(each.items.len(), 2);
+        for i in &each.items {
+            let dir = each.settings.category_dir(i.category, &each.downloads);
+            assert_eq!(i.dest.parent(), Some(dir.as_path()), "{:?}", i.dest);
+        }
+        assert_ne!(
+            each.items[0].dest.parent(),
+            each.items[1].dest.parent(),
+            "a picture and an archive: two categories' folders"
+        );
+
+        let folder = std::env::temp_dir().join("mdm-batch-1403");
+        let mut one = app();
+        one.add_batch(added(Some(&folder)));
+        let dests: Vec<_> = one.items.iter().map(|i| i.dest.clone()).collect();
+        assert_eq!(dests, [folder.join("img01.jpg"), folder.join("part02.zip")]);
+        assert!(!folder.exists(), "nothing made on the disk by OK");
+    }
+}
+
+#[cfg(test)]
 mod add_checksum_tests {
     use super::*;
 
@@ -14942,6 +15088,112 @@ mod stop_all_tests {
     }
 }
 
+/// A live stream stopped and saved by hand: MDM's own stops never fight its saving nor end its
+/// recording for a speed limit, and a queue never starts again one whose saving failed.
+#[cfg(test)]
+mod live_save_tests {
+    use super::*;
+    use mdm_tools::video::LiveState;
+
+    /// A recording being saved is left alone by every stop of MDM's own (none would stop it, and
+    /// a start after would record over it); a recording is left alone by a new speed limit only
+    /// (it applies from its next start), while a network adapter change or the download limit
+    /// still stop it; every other download is stopped as before.
+    #[test]
+    fn mdms_own_stops_spare_a_saving_and_a_speed_limit_spares_a_recording() {
+        for why in [AutoStop::Adapter, AutoStop::Quota, AutoStop::SpeedLimit] {
+            assert!(auto_stop_spares(why, Some(LiveState::Saving)), "{why:?}");
+            assert!(!auto_stop_spares(why, None), "{why:?}");
+        }
+        assert!(auto_stop_spares(
+            AutoStop::SpeedLimit,
+            Some(LiveState::Recording)
+        ));
+        assert!(!auto_stop_spares(
+            AutoStop::Adapter,
+            Some(LiveState::Recording)
+        ));
+        assert!(!auto_stop_spares(
+            AutoStop::Quota,
+            Some(LiveState::Recording)
+        ));
+    }
+
+    /// A stop of a live stream being recorded saves it and remembers that it did; a stop of
+    /// anything else (a live stream not recording yet, one already over, any other download)
+    /// stops it only.
+    #[test]
+    fn a_stop_of_a_recording_marks_it_saved() {
+        let (rec, saving) = (Some(LiveState::Recording), Some(LiveState::Saving));
+        assert!(halt_saved(rec, saving));
+        // Its run ended just then: the save was a Stop, which leaves nothing to hold.
+        assert!(halt_saved(rec, None));
+        // Its recording began between the look and the stop.
+        assert!(halt_saved(None, saving));
+        // Saved already (a second Stop): still saved by hand.
+        assert!(halt_saved(saving, saving));
+        assert!(!halt_saved(None, None));
+    }
+
+    /// A live stream a stop began to save, whose saving failed (its recording left as it was), is
+    /// held in a running queue, and in one started anew, never retried; one that failed by itself
+    /// is retried as before; the user's own start of it is a start like any other.
+    #[test]
+    fn a_running_queue_never_retries_a_download_that_failed_after_its_stop() {
+        let address = |n: &str| url::Url::parse(&format!("http://127.0.0.1:9/{n}")).unwrap();
+        let mut saved = Item::new(
+            1,
+            address("live.mp4"),
+            PathBuf::from("live.mp4"),
+            Category::Video,
+        );
+        saved.status = Status::Error;
+        let mut failed = Item::new(
+            2,
+            address("file.bin"),
+            PathBuf::from("file.bin"),
+            Category::General,
+        );
+        failed.status = Status::Error;
+        let mut app = super::start_disk_tests::app_with(vec![saved, failed]);
+        // A queue's stop: not stopped by hand, saved all the same.
+        app.saved_by_hand.insert(1);
+        let now = Instant::now();
+        assert_eq!(app.member_of(&app.items[0], now), Member::Held);
+        assert!(matches!(
+            app.member_of(&app.items[1], now),
+            Member::Failed { .. }
+        ));
+        let q = Queue {
+            items: vec![1, 2],
+            running: true,
+            ..Queue::new("Main download queue", false)
+        };
+        let members = app.members(now + queue::RETRY_DELAY);
+        assert_eq!(
+            queue::to_start(&q, |id| member_in(&members, id), now + queue::RETRY_DELAY),
+            [2]
+        );
+        // The queue started anew (by hand, its start time, at login): still held.
+        for q in &mut app.queues {
+            q.items.retain(|id| *id == 1);
+            q.running = false;
+        }
+        app.queues[0].items = vec![1];
+        app.start_queue(0);
+        assert!(app.queues[0].running);
+        assert!(app.items[0].live.is_none());
+        assert_eq!(app.member_of(&app.items[0], now), Member::Held);
+        // The user's own start of it (held back by the download limit here, so that nothing
+        // downloads in the test).
+        app.settings.limits_on = true;
+        app.quota.blocked = true;
+        app.start(1, false);
+        assert!(!app.saved_by_hand.contains(&1));
+        assert!(app.quota.held.contains(&1));
+    }
+}
+
 #[cfg(test)]
 mod pane_tests {
     use super::{Pane, tab_to};
@@ -14993,7 +15245,7 @@ mod start_disk_tests {
     /// slow machine's first use of what is loaded once (the interface's catalogs).
     const AT_ONCE: Duration = Duration::from_secs(5);
 
-    fn app_with(items: Vec<Item>) -> std::mem::ManuallyDrop<App> {
+    pub(super) fn app_with(items: Vec<Item>) -> std::mem::ManuallyDrop<App> {
         let rt = Box::leak(Box::new(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

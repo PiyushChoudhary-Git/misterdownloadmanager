@@ -219,6 +219,10 @@
 #. a torrent through a debrid service: one of its files has a name that would be written outside its folder; nothing was written. {name} the file's name as the service gave it
 #. {name} = a file name (keep the braces as they are)
 	A file of this torrent can't be saved safely: {name}	لا يمكن حفظ ملف هذا التورنت بأمان: {name}
+#. text in a dialog box
+#. the question about a name typed in Save As, above the file's path; the choices are the duplicate question's (numbered name, overwrite)
+#, machine
+	A file with this name is already there:	يوجد ملف بهذا الاسم بالفعل:
 #. message or event log entry in the main window
 #. Link grabber added a magnet link whose torrent could not be found; {error} says why
 #. {error} = an error message (keep the braces as they are)
@@ -1469,6 +1473,10 @@
 #. text in a download's progress window; text in a download's Properties window
 #. noun: a file of no known type
 	File	ملف
+#. text in a dialog box
+#. window title: the question asked when the name typed in Download File Info's Save As is a file already there
+#, machine
+	File already exists	الملف موجود بالفعل
 #. text in the Options window
 #. tooltip of "Mark downloaded files as coming from the internet" on Linux
 #, machine
@@ -2386,6 +2394,14 @@
 #. text in countries.rs
 #. a country's name (where a download's server is)
 	Morocco	المغرب
+#. text in playlistdlg.rs
+#. a quality in Download video for a whole playlist: each video's best H.264 video with AAC sound, an MP4 that every video editor, TV and phone plays; keep "(H.264 + AAC)" as it is
+#, machine
+	Most compatible (H.264 + AAC)	الأكثر توافقا (H.264 + AAC)
+#. text in the Download video window
+#. a choice in the Download video window: the best H.264 video with AAC sound, an MP4 that every video editor, TV and phone plays; keep "(H.264 + AAC)" as it is; {height} is the resolution (1080p)
+#, machine
+	Most compatible (H.264 + AAC) · {height}	الأكثر توافقا (H.264 + AAC) · {height}
 #. button in a download's Properties window
 #. verb: move the file to another folder
 	Move	نقل
@@ -3038,6 +3054,11 @@
 #. event log entry: Recheck failed, with the reason
 #. {error} = an error message (keep the braces as they are)
 	Recheck failed: {error}	فشل إعادة التحقق: {error}
+#. text in a download's progress window
+#. a live stream's status: yt-dlp records it (it shows no progress, only the size so far)
+#. the trailing ... means it is still going on: keep it
+#, machine
+	Recording...	جارٍ التسجيل...
 #. message or event log entry in the main window
 #. window title, verb: download the file again from the start
 	Redownload	إعادة التنزيل
@@ -3205,6 +3226,11 @@
 #. label over the folder the downloads were saved in
 #. label before the folder the torrent is saved in
 	Saved in	محفوظ في
+#. text in a download's progress window
+#. a live stream's status: stopped, and what was recorded being made into the video file kept
+#. the trailing ... means it is still going on: keep it
+#, machine
+	Saving...	جارٍ الحفظ...
 #. tab in the Scheduler window
 #. noun: tab title; when the queue starts and stops
 	Schedule	جدولة
@@ -3591,6 +3617,10 @@
 #. text in remote.rs; text in the Add torrent window
 #. remote control page (on a phone): button: stop a queue
 	Stop	إيقاف
+#. text in a download's progress window
+#. button in a live stream's progress window: stop recording it and keep what was recorded as a video file
+#, machine
+	Stop and save	إيقاف وحفظ
 #. text in the Scheduler window; checkbox in the Scheduler window
 	Stop download at	إيقاف التنزيل عند
 #. text in playlistdlg.rs
@@ -4481,6 +4511,10 @@
 #. button in helpers.rs
 #. Video helpers: button: go back to the copy MDM downloads and checks itself
 	Use MDM's own copy	استخدام نسخة MDM الخاصة
+#. checkbox in the Options window
+#. Options → Sites Logins: checkbox under Cookies for video sites: yt-dlp also reads the person's own yt-dlp config file
+#, machine
+	Use my yt-dlp config file	استخدام ملف إعدادات yt-dlp الخاص بي
 #. text in the Batch download window
 #. why Batch download's OK is greyed
 	Use one * only	استخدم نجمة واحدة فقط
@@ -4749,6 +4783,10 @@
 #. in Download video and the browser's video menu: yt-dlp had no JavaScript runtime, so YouTube listed only some qualities (often only the sound); Node.js and Deno are program names
 #, machine
 	YouTube needs a JavaScript runtime to list its video qualities: install Node.js or Deno, then look it up again	يحتاج YouTube إلى وقت تشغيل JavaScript لسرد جودات الفيديو: ثبت Node.js أو Deno، ثم ابحث عنه مرة أخرى
+#. text in the Options window
+#. Options → Sites Logins → Use my yt-dlp config file: its tooltip
+#, machine
+	yt-dlp also reads its own config files (on Windows %APPDATA%\\yt-dlp\\config.txt, on Linux and macOS ~/.config/yt-dlp/config). Most of what MDM chooses, the folder, the name and the quality, still wins, but options there that skip or filter videos apply too.	يقرأ yt-dlp أيضًا ملفات الإعدادات الخاصة به (في Windows: %APPDATA%\\yt-dlp\\config.txt، وفي Linux وmacOS: ~/.config/yt-dlp/config). يبقى معظم ما يختاره MDM، أي المجلد والاسم والجودة، هو المعتمد، لكن الخيارات الموجودة فيها التي تتخطى مقاطع الفيديو أو تصفّيها تُطبَّق أيضًا.
 #. text in the Download video window
 #. the Download video window: yt-dlp couldn't read the cookies of the browser chosen in Options (Chrome, Edge...), which holds them while it runs; {browser} = its name
 	yt-dlp can't read {browser}'s cookies while {browser} is open. Close {browser} and look the page up again, or choose Firefox in Options → Sites Logins.	لا يمكن لـ yt-dlp قراءة ملفات تعريف الارتباط الخاصة بـ {browser} أثناء فتح {browser}. أغلق {browser} وابحث عن الصفحة مرة أخرى، أو اختر Firefox في الخيارات ← تسجيلات دخول المواقع.
@@ -5319,6 +5357,10 @@ extension	Mister Download Manager then downloads through the same proxy as this 
 #. text in the browser extension
 #. the small arrow next to the Download video button that opens its menu (read aloud by screen readers)
 extension	More options	المزيد من الخيارات
+#. text in the browser extension
+#. in the list under the download button over a video, after a quality's height (1080p): the H.264 video with AAC sound in an MP4, the file that plays in every video editor, TV and phone; short, about 20 characters at most
+#, machine
+extension	Most compatible	الأكثر توافقا
 #. text in the browser extension
 #. menu command of the download button over a video: never show the button on this web site again
 #. {site} = a web site's name such as "example.com" (keep the braces as they are)
