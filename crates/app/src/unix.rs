@@ -109,8 +109,8 @@ pub fn torrent_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
 /// that gap by another program can still make this remove the wrong file. (Windows deletes
 /// through the verified handle.)
 pub fn remove_owned_torrent_file(path: &Path, expected: [u64; 5]) -> std::io::Result<bool> {
-    let file = std::fs::File::open(path)?;
-    if torrent_file_identity(&file)? != expected || torrent_file_identity_at(path)? != expected {
+    // Without following a link or waiting on a pipe: the identity read of the path does both.
+    if torrent_file_identity_at(path)? != expected {
         return Ok(false);
     }
     std::fs::remove_file(path)?;

@@ -138,6 +138,13 @@ fn fold_case(path: PathBuf) -> PathBuf {
     }
 }
 
+fn outside_error() -> io::Error {
+    io::Error::other(crate::i18n::t(
+        // i18n: a torrent's folder is a link or junction leading outside its destination
+        "A torrent file's folder points outside its destination",
+    ))
+}
+
 /// Open or make the file at `path` without following a link, and check the handle itself is
 /// where `expected` says (the folder it is in, resolved before): a folder swapped
 /// for a junction or a link after the checks leads elsewhere, and what this made there is taken
@@ -152,12 +159,6 @@ fn open_inside(path: &Path, create: bool, expected: &Path) -> io::Result<std::fs
         }
         e
     };
-    let outside = || {
-        io::Error::other(crate::i18n::t(
-            // i18n: a torrent's folder is a link or junction leading outside its destination
-            "A torrent file's folder points outside its destination",
-        ))
-    };
     match torrent_file_path(&file) {
         Ok(real)
             if real
@@ -166,7 +167,7 @@ fn open_inside(path: &Path, create: bool, expected: &Path) -> io::Result<std::fs
         {
             Ok(file)
         }
-        Ok(real) => Err(refuse(&file, Some(&real), outside())),
+        Ok(real) => Err(refuse(&file, Some(&real), outside_error())),
         // A system that can't say where a handle is keeps the checks before the open.
         Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(file),
         Err(e) => Err(refuse(&file, None, e)),
@@ -560,6 +561,11 @@ impl Ownership {
         let mut reset: HashSet<usize> = HashSet::new();
         // Where each folder really is, found once, before its files are opened.
         let mut homes: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // Where the torrent's folder is, worked out once: every file's folder is checked against
+        // this same answer, and the same `expected` the handle is then compared with, so a
+        // folder swapped for a junction between the checks cannot make both agree on outside.
+        let folder_key = key(folder);
+        let multi = self.files.len() != 1;
         let result = (|| {
             let mut paths = Vec::new();
             // Validate every path before opening or allocating anything, even unticked and
@@ -576,11 +582,8 @@ impl Ownership {
                 } else {
                     folder.join(&claim.path)
                 };
-                if self.files.len() != 1 && !key(path.parent().unwrap()).starts_with(key(folder)) {
-                    return Err(io::Error::other(crate::i18n::t(
-                        // i18n: a torrent's folder is a link or junction leading outside its destination
-                        "A torrent file's folder points outside its destination",
-                    )));
+                if multi && !key(path.parent().unwrap()).starts_with(&folder_key) {
+                    return Err(outside_error());
                 }
                 paths.push(path);
             }
@@ -617,6 +620,9 @@ impl Ownership {
                         // Open without create/truncate/set_len, then identify this handle.
                         // A name replacement before open cannot borrow the old object's grant.
                         let expected = expected_path(&mut homes, &path);
+                        if multi && !expected.starts_with(&folder_key) {
+                            return Err(outside_error());
+                        }
                         let file = open_inside(&path, false, &expected)?;
                         let id = identity(&file).ok();
                         let allowed = id.is_some_and(|id| {
@@ -646,11 +652,16 @@ impl Ownership {
             // No foreign file remains unchecked. Allocate only with create_new; an object
             // winning this race needs its own consent, never a silent overwrite.
             for (claim, path) in missing {
-                if self.files.len() != 1 && !key(path.parent().unwrap()).starts_with(key(folder)) {
+                if multi && !key(path.parent().unwrap()).starts_with(&folder_key) {
                     return Err(io::ErrorKind::PermissionDenied.into());
                 }
                 Self::mkdirs(folder, path.parent().unwrap(), &mut new_directories)?;
+                // Resolved after the folders are made, and checked against the folder as it was
+                // before: this answer is the one the handle is held to.
                 let expected = expected_path(&mut homes, &path);
+                if multi && !expected.starts_with(&folder_key) {
+                    return Err(outside_error());
+                }
                 match open_inside(&path, true, &expected) {
                     Ok(file) => {
                         match identity(&file) {
@@ -1806,6 +1817,8 @@ mod tests {
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         if made.is_ok_and(|s| s.success()) {
             assert!(identity_at(&fifo).is_err());
+            // Nor does removing by identity wait on it or follow it.
+            assert!(remove_owned_torrent_file(&fifo, [0; 5]).is_err());
         }
         assert!(identity_at(tmp.path()).is_ok());
         assert!(identity_at(&tmp.path().join("missing")).is_err());
@@ -2048,5 +2061,22 @@ mod tests {
         // Whatever order they ran in, one more delete leaves nothing of the torrent.
         let kept = own.delete(tmp.path(), &root, &root, false, &[]).unwrap();
         assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// A folder of the torrent that leads outside it (a link) stops the start with nothing made
+    /// there. (The swap between the checks and the open cannot be timed; the flipping test above
+    /// makes it happen as often as it can.)
+    #[test]
+    fn direct_a_folder_that_resolves_outside_the_torrents_stops_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Set");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        link_dir(&outside, &root.join("d"));
+        let own = owner(&["d/a.bin", "d/b.bin"]);
+        own.initialize(tmp.path(), &root, &root, &[]).unwrap();
+        assert!(own.prepare(tmp.path(), &root, &root).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 }
